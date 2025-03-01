@@ -21,6 +21,8 @@ import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
 import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader.js';
 import { TeapotGeometry } from 'three/addons/geometries/TeapotGeometry.js';
 
+import init, { greet } from "./pkg/simulation";
+
 import {
     EffectComposer,
     RenderPass,
@@ -329,8 +331,11 @@ class Simulation {
     }
 }
 
-function main() {
+async function main() {
     new Simulation();
+    await init();
+    const greeting = greet();
+    console.log(greeting);
 }
 
 main();
