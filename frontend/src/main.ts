@@ -4,7 +4,7 @@ import Stats from 'three/addons/libs/stats.module.js';
 import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
 import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader.js';
 
-import init, { greet } from "./pkg/simulation";
+import init, { Simulation } from "./pkg/simulation";
 
 import {
     EffectComposer,
@@ -27,6 +27,7 @@ class GlassRendering {
     private bloomPass!: SelectiveBloomEffect;
     private floor!: THREE.Mesh;
     private particles!: THREE.Points;
+    private simulation!: Simulation;
 
     constructor() {
         this.init();
@@ -46,6 +47,8 @@ class GlassRendering {
         this.setupControls();
         this.setupGUI();
         this.setupEventListeners();
+
+        this.setupSimulation();
         this.startAnimationLoop();
     }
 
@@ -90,20 +93,13 @@ class GlassRendering {
 
     private createParticles() {
         const geometry = new THREE.BufferGeometry();
-        const positions = [];
-        const numParticles = 10000;
-        const boundingBoxDim = 5;
-        const yOffset = 2;
+        const positions: number[] = [];
 
-        for (let i = 0; i < numParticles; i++) {
-            positions.push((Math.random() - 0.5) * boundingBoxDim); // x
-            positions.push((Math.random() - 0.5) * boundingBoxDim + yOffset); // y
-            positions.push((Math.random() - 0.5) * boundingBoxDim); // z
-        }
+        geometry.setAttribute('position',
+            new THREE.Float32BufferAttribute(positions, 3));
 
-        geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-
-        const texture = new THREE.TextureLoader().load('textures/sprites/disc.png'); // Load the texture
+        const texture = new THREE.TextureLoader()
+            .load('textures/sprites/disc.png');
 
         const material = new THREE.PointsMaterial({
             size: 0.1,
@@ -129,7 +125,7 @@ class GlassRendering {
         });
         const floor = new THREE.Mesh(geometry, material);
         floor.rotation.x = -Math.PI / 2;
-        floor.position.y = -1;
+        floor.position.y = -0.1;
         this.floor = floor;
         this.scene.add(floor);
     }
@@ -150,7 +146,6 @@ class GlassRendering {
       const effectPass = new EffectPass(this.camera, this.bloomPass);
       this.composer.addPass(effectPass);
     }
-
 
     private setupHDR() {
         new RGBELoader()
@@ -174,8 +169,9 @@ class GlassRendering {
     }
 
     private updateMaterialEnvMap(mesh: THREE.Object3D, envMap: THREE.Texture) {
-        if (mesh instanceof THREE.Mesh && (mesh.material instanceof THREE.MeshStandardMaterial||
-          mesh.material instanceof THREE.MeshPhysicalMaterial)) {
+        if (mesh instanceof THREE.Mesh &&
+            (mesh.material instanceof THREE.MeshStandardMaterial ||
+             mesh.material instanceof THREE.MeshPhysicalMaterial)) {
             mesh.material.envMap = envMap;
             mesh.material.needsUpdate = true;
         }
@@ -213,8 +209,22 @@ class GlassRendering {
         this.composer.setSize(window.innerWidth, window.innerHeight);
     }
 
+    private updateParticlePositions() {
+        this.simulation.update();
+        const positions = this.simulation.get_particle_positions();
+        this.particles.geometry.setAttribute('position',
+            new THREE.Float32BufferAttribute(positions, 3));
+
+        this.particles.geometry.attributes.position.needsUpdate = true;
+    }
+
+    private setupSimulation() {
+        this.simulation = new Simulation();
+    }
+
     private animate() {
         this.stats.update();
+        this.updateParticlePositions();
         this.composer.render();
     }
 
@@ -224,10 +234,8 @@ class GlassRendering {
 }
 
 async function main() {
-    new GlassRendering();
     await init();
-    const greeting = greet();
-    console.log(greeting);
+    new GlassRendering();
 }
 
 main();
