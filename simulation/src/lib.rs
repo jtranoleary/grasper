@@ -16,6 +16,8 @@
 
 use instant::Instant;
 use js_sys;
+use std::cmp;
+use std::f32::consts::PI;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -41,6 +43,17 @@ pub struct Particle {
 }
 
 #[wasm_bindgen]
+pub struct UniformGrid {
+    cells: Vec<Vec<usize>>,
+    cell_size: f32,
+    num_x: usize,
+    num_y: usize,
+    num_z: usize,
+    bounding_box_min: Vec3,
+    bounding_box_max: Vec3,
+}
+
+#[wasm_bindgen]
 pub struct Simulation {
     particles: Vec<Particle>,
     floor_y: f32,
@@ -60,6 +73,83 @@ impl Vec3 {
             y,
             z
         }
+    }
+}
+
+#[wasm_bindgen]
+impl UniformGrid {
+    pub fn new(cell_size: f32, bounding_box_min: Vec3,
+                bounding_box_max: Vec3) -> UniformGrid {
+        let num_x = bounding_box_max.x - bounding_box_min.x;
+        let num_y = bounding_box_max.y - bounding_box_min.y;
+        let num_z = bounding_box_max.z - bounding_box_min.z;
+
+        let num_x = (num_x / cell_size).ceil() as usize;
+        let num_y = (num_y / cell_size).ceil() as usize;
+        let num_z = (num_z / cell_size).ceil() as usize;
+
+        let num_cells = num_x * num_y * num_z;
+        let cells = vec![Vec::new(); num_cells];
+
+        UniformGrid {
+            cells,
+            cell_size,
+            num_x,
+            num_y,
+            num_z,
+            bounding_box_min,
+            bounding_box_max,
+        }
+    }
+
+    fn get_cell_index(&self, ix: usize, iy: usize, iz: usize) -> usize {
+        ix + iy * self.num_x + iz * self.num_x * self.num_y
+    }
+
+    pub fn insert_particle(&mut self, particle_index: usize, position: Vec3) {
+      let ix = ((position.x - self.bounding_box_min.x) / self.cell_size)
+                        .floor() as usize;
+      let iy = ((position.y - self.bounding_box_min.y) / self.cell_size)
+                        .floor() as usize;
+      let iz = ((position.z - self.bounding_box_min.z) / self.cell_size)
+                        .floor() as usize;
+
+      let ix = cmp::min(cmp::max(ix, 0), self.num_x - 1);
+      let iy = cmp::min(cmp::max(iy, 0), self.num_y - 1);
+      let iz = cmp::min(cmp::max(iz, 0), self.num_z - 1);
+
+      let cell_index = self.get_cell_index(ix, iy, iz);
+      self.cells[cell_index].push(particle_index);
+    }
+
+    pub fn clear(&mut self) {
+        for cell in &mut self.cells {
+            cell.clear();
+        }
+    }
+
+    pub fn find_neighbors(&self, position: Vec3) -> Vec<usize> {
+        let mut neighbors = Vec::new();
+        let ix = ((position.x - self.bounding_box_min.x) / self.cell_size)
+                            .floor() as usize;
+        let iy = ((position.y - self.bounding_box_min.y) / self.cell_size)
+                            .floor() as usize;
+        let iz = ((position.z - self.bounding_box_min.z) / self.cell_size)
+                            .floor() as usize;
+
+        let ix = cmp::min(cmp::max(ix, 0), self.num_x - 1);
+        let iy = cmp::min(cmp::max(iy, 0), self.num_y - 1);
+        let iz = cmp::min(cmp::max(iz, 0), self.num_z - 1);
+
+        for z in (iz.saturating_sub(1))..=(cmp::min(iz + 1, self.num_z - 1)) {
+            for y in (iy.saturating_sub(1))..=(cmp::min(iy + 1, self.num_y - 1)) {
+                for x in (ix.saturating_sub(1))..=(cmp::min(ix + 1, self.num_x - 1)) {
+                    let cell_index = self.get_cell_index(x, y, z);
+                    neighbors.extend(&self.cells[cell_index]);
+                }
+            }
+        }
+        neighbors
     }
 }
 
@@ -129,6 +219,8 @@ impl Simulation {
         };
         self.last_update_time = Some(now);
 
+        self.grid.clear();
+
         for particle in &mut self.particles {
             particle.vy += self.gravity * dt;
 
@@ -139,6 +231,11 @@ impl Simulation {
             particle.x += particle.vx * dt;
             particle.y += particle.vy * dt;
             particle.z += particle.vz * dt;
+        }
+
+        for (index, particle) in self.particles.iter().enumerate() {
+            self.grid.insert_particle(index,
+                Vec3::new(particle.x, particle.y, particle.z));
         }
 
         for particle in &mut self.particles {
