@@ -141,9 +141,9 @@ impl UniformGrid {
         let iy = cmp::min(cmp::max(iy, 0), self.num_y - 1);
         let iz = cmp::min(cmp::max(iz, 0), self.num_z - 1);
 
-        for z in (iz.saturating_sub(1))..=(cmp::min(iz + 1, self.num_z - 1)) {
-            for y in (iy.saturating_sub(1))..=(cmp::min(iy + 1, self.num_y - 1)) {
-                for x in (ix.saturating_sub(1))..=(cmp::min(ix + 1, self.num_x - 1)) {
+        for z in (cmp::min(iz - 1, 0))..=(cmp::min(iz + 1, self.num_z - 1)) {
+            for y in (cmp::min(iy - 1, 0))..=(cmp::min(iy + 1, self.num_y - 1)) {
+                for x in (cmp::min(ix - 1, 0))..=(cmp::min(ix + 1, self.num_x - 1)) {
                     let cell_index = self.get_cell_index(x, y, z);
                     neighbors.extend(&self.cells[cell_index]);
                 }
@@ -210,6 +210,42 @@ impl Simulation {
         }
     }
 
+    fn kernel_poly6(&self, r_squared: f32, d: f32) -> f32 {
+        let d_squared = d * d;
+        if r_squared >= 0.0 && r_squared <= d_squared {
+            let factor = 315.0 / (64.0 * PI * d.powi(9));
+            return factor * (d_squared - r_squared).powi(3);
+        }
+        0.0
+    }
+
+    fn grad_kernel_poly6(&self, r: f32, d: f32) -> f32 {
+        let d_squared = d * d;
+        if r >= 0.0 && r <= d {
+          let factor = -945.0 / (32.0 * PI * d.powi(9));
+          return factor * (d_squared - r * r).powi(2) * r;
+        }
+        0.0
+    }
+
+    fn calculate_density(&self, particle_index: usize) -> f32 {
+        let particle = &self.particles[particle_index];
+        let position = Vec3::new(particle.x, particle.y, particle.z);
+        let neighbors = self.grid.find_neighbors(position);
+        let mut density = 0.0;
+        let cutoff = self.grid.cell_size;
+
+        for &neighbor_index in &neighbors {
+            let neighbor = &self.particles[neighbor_index];
+            let dx = neighbor.x - particle.x;
+            let dy = neighbor.y - particle.y;
+            let dz = neighbor.z - particle.z;
+            let r_squared = dx * dx + dy * dy + dz * dz;
+            density += self.kernel_poly6(r_squared, cutoff);
+        }
+        density
+    }
+
     pub fn update(&mut self) {
         let now = instant::Instant::now();
         let dt = match self.last_update_time {
@@ -221,6 +257,7 @@ impl Simulation {
 
         self.grid.clear();
 
+        // 1. Apply external forces and predict positions.
         for particle in &mut self.particles {
             particle.vy += self.gravity * dt;
 
@@ -233,11 +270,65 @@ impl Simulation {
             particle.z += particle.vz * dt;
         }
 
+        // 2. Re-insert particles into the grid (using predicted positions).
         for (index, particle) in self.particles.iter().enumerate() {
             self.grid.insert_particle(index,
                 Vec3::new(particle.x, particle.y, particle.z));
         }
 
+        // 3. Constraint projection
+        let num_iterations = 4;
+        for _ in 0..num_iterations {
+            for i in 0..self.particles.len() {
+                let density_i = self.calculate_density(i);
+                let pressure_i = self.stiffness * (density_i -
+                                    self.rest_density);
+
+                let particle_i = &self.particles[i];
+                let position_i = Vec3::new(
+                    particle_i.x,
+                    particle_i.y,
+                    particle_i.z
+                );
+                let neighbors = self.grid.find_neighbors(position_i);
+
+                let mut dx = 0.0;
+                let mut dy = 0.0;
+                let mut dz = 0.0;
+
+                for &j in &neighbors {
+                    if i == j { continue; }
+                    let particle_j = &self.particles[j];
+
+                    let nx = particle_j.x - particle_i.x;
+                    let ny = particle_j.y - particle_i.y;
+                    let nz = particle_j.z - particle_i.z;
+                    let r = (nx * nx + ny * ny + nz * nz).sqrt();
+                    let h = self.grid.cell_size;
+
+                    if r < h && r > 1e-12 {
+                        let grad_c_i = self.grad_kernel_poly6(r, h)
+                                        * nx / r / self.rest_density;
+                        let grad_c_j = self.grad_kernel_poly6(r, h)
+                                        * ny / r / self.rest_density;
+                        let grad_c_k = self.grad_kernel_poly6(r, h)
+                                        * nz / r / self.rest_density;
+
+                        let correction = pressure_i / self.rest_density;
+                        dx -= grad_c_i * correction;
+                        dy -= grad_c_j * correction;
+                        dz -= grad_c_k * correction;
+                    }
+                }
+
+                let particle_i = &mut self.particles[i];
+                particle_i.x += dx;
+                particle_i.y += dy;
+                particle_i.z += dz;
+            }
+        }
+
+        // 4. Update previous position and handle collisions (floor).
         for particle in &mut self.particles {
             particle.vx = (particle.x - particle.px) / dt;
             particle.vy = (particle.y - particle.py) / dt;
