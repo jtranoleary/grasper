@@ -183,19 +183,25 @@ class GlassRendering {
     }
 
     private setupGUI() {
-      this.stats = new Stats();
-      document.body.appendChild(this.stats.dom);
-      this.gui = new GUI();
+        this.stats = new Stats();
+        document.body.appendChild(this.stats.dom);
+        this.gui = new GUI();
 
-      const bloomFolder = this.gui.addFolder('Bloom');
-      bloomFolder.add(this.bloomPass, 'intensity', 0, 3)
-          .name('Intensity');
-      bloomFolder.add(this.bloomPass.luminanceMaterial, 'threshold', 0, 1)
-          .name('Threshold');
-      bloomFolder.add(this.bloomPass.luminanceMaterial, 'smoothing', 0, 1)
-          .name('Smoothing');
-      bloomFolder.add(this.bloomPass.mipmapBlurPass, 'radius', 0.1, 2, 0.01)
-          .name('Mipmap Blur Radius');
+        const bloomFolder = this.gui.addFolder('Bloom');
+        bloomFolder.add(this.bloomPass, 'intensity', 0, 3)
+            .name('Intensity');
+        bloomFolder.add(this.bloomPass.luminanceMaterial, 'threshold', 0, 1)
+            .name('Threshold');
+        bloomFolder.add(this.bloomPass.luminanceMaterial, 'smoothing', 0, 1)
+            .name('Smoothing');
+        bloomFolder.add(this.bloomPass.mipmapBlurPass, 'radius', 0.1, 2, 0.01)
+            .name('Mipmap Blur Radius');
+
+        const actions = {
+            resetParticles: () => this.simulation.reset_particles()
+        };
+
+        this.gui.add(actions, 'resetParticles').name('Reset Particles');
   }
 
     private setupEventListeners() {
