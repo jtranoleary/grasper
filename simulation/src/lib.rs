@@ -38,27 +38,15 @@ pub struct Simulation {
 impl Simulation {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Simulation {
-        let num_particles = 10000;
-        let bounding_box_dim = 5.0;
-        let y_offset = 2.0;
-        let mut particles = Vec::with_capacity(num_particles);
-
-        for _ in 0..num_particles {
-            particles.push(Particle {
-                x: (js_sys::Math::random() as f32 - 0.5) * bounding_box_dim,
-                y: (js_sys::Math::random() as f32 - 0.5) * bounding_box_dim +
-                    y_offset,
-                z: (js_sys::Math::random() as f32 - 0.5) * bounding_box_dim,
-                vy: 0.0
-            });
-        }
-
-        Simulation {
-            particles,
+        let mut simulation = Simulation {
+            particles: Vec::new(),
             floor_y: 0.0,
             gravity: -9.8,
             last_update_time: Some(instant::Instant::now())
-        }
+        };
+        simulation.reset_particles();
+
+        simulation
     }
 
     pub fn update(&mut self) {
@@ -89,5 +77,24 @@ impl Simulation {
             positions.push(particle.z);
         }
         positions
+    }
+
+    pub fn reset_particles(&mut self) {
+        let num_particles = 10000;
+        let bounding_box_dim = 5.0;
+        let y_offset = 2.0;
+        let mut particles = Vec::with_capacity(num_particles);
+
+        for _ in 0..num_particles {
+            particles.push(Particle {
+                x: (js_sys::Math::random() as f32 - 0.5) * bounding_box_dim,
+                y: (js_sys::Math::random() as f32 - 0.5) * bounding_box_dim +
+                    y_offset,
+                z: (js_sys::Math::random() as f32 - 0.5) * bounding_box_dim,
+                vy: 0.0
+            });
+        }
+
+        self.particles = particles;
     }
 }
