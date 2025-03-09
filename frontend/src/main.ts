@@ -17,6 +17,7 @@ import {
 const hdrTextureURL = new URL('/hdri/machine_shop.hdr', import.meta.url).href;
 
 class GlassRendering {
+    boundingBoxDim: number;
     private camera!: THREE.PerspectiveCamera;
     private scene!: THREE.Scene;
     private renderer!: THREE.WebGLRenderer;
@@ -29,7 +30,8 @@ class GlassRendering {
     private particles!: THREE.Points;
     private simulation!: Simulation;
 
-    constructor() {
+    constructor(boundingBoxDim: number) {
+        this.boundingBoxDim = boundingBoxDim;
         this.init();
     }
 
@@ -45,19 +47,15 @@ class GlassRendering {
 
         this.setupHDR();
         this.setupControls();
-        this.setupGUI();
         this.setupEventListeners();
 
         this.setupSimulation();
+        this.setupGUI();
         this.startAnimationLoop();
     }
 
     private createScene() {
         this.scene = new THREE.Scene();
-
-        const light = new THREE.DirectionalLight(0xffffff, /*intensity=*/1);
-        light.position.set(1, 3, 2);
-        this.scene.add(light);
     }
 
     private createCamera() {
@@ -115,7 +113,8 @@ class GlassRendering {
     }
 
     private createFloor() {
-        const geometry = new THREE.PlaneGeometry(10, 10);
+        const geometry = new THREE.PlaneGeometry(this.boundingBoxDim,
+                                                 this.boundingBoxDim);
         const material = new THREE.MeshPhysicalMaterial({
             color: 0x808080,
             roughness: 0.1,
@@ -196,12 +195,16 @@ class GlassRendering {
             .name('Smoothing');
         bloomFolder.add(this.bloomPass.mipmapBlurPass, 'radius', 0.1, 2, 0.01)
             .name('Mipmap Blur Radius');
+        bloomFolder.close();
+
+        const fluidFolder = this.gui.addFolder('Fluid');
 
         const actions = {
             resetParticles: () => this.simulation.reset_particles()
         };
 
-        this.gui.add(actions, 'resetParticles').name('Reset Particles');
+        fluidFolder.add(this.simulation, 'stiffness').name('Stiffness');
+        fluidFolder.add(actions, 'resetParticles').name('Reset Particles');
   }
 
     private setupEventListeners() {
@@ -225,7 +228,7 @@ class GlassRendering {
     }
 
     private setupSimulation() {
-        this.simulation = new Simulation();
+        this.simulation = new Simulation(this.boundingBoxDim);
     }
 
     private animate() {
@@ -241,7 +244,7 @@ class GlassRendering {
 
 async function main() {
     await init();
-    new GlassRendering();
+    new GlassRendering(5.0);
 }
 
 main();

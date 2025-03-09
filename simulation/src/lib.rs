@@ -21,7 +21,7 @@ use std::f32::consts::PI;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Vec3 {
     x: f32,
     y: f32,
@@ -29,7 +29,7 @@ pub struct Vec3 {
 }
 
 #[wasm_bindgen]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Particle {
     x: f32,
     y: f32,
@@ -56,12 +56,13 @@ pub struct UniformGrid {
 #[wasm_bindgen]
 pub struct Simulation {
     particles: Vec<Particle>,
+    bounding_box_dim: f32,
     floor_y: f32,
     gravity: f32,
     last_update_time: Option<Instant>,
     grid: UniformGrid,
     rest_density: f32,
-    stiffness: f32,
+    pub stiffness: f32,
     viscosity: f32,
 }
 
@@ -156,10 +157,8 @@ impl UniformGrid {
 #[wasm_bindgen]
 impl Simulation {
     #[wasm_bindgen(constructor)]
-    pub fn new() -> Simulation {
-        let num_particles = 2000;
-        let bounding_box_dim = 5.0;
-        let y_offset = 2.0;
+    pub fn new(bounding_box_dim: f32) -> Simulation {
+        let num_particles = 1000;
         let floor_y = 0.0;
         let mut particles = Vec::with_capacity(num_particles);
 
@@ -173,41 +172,28 @@ impl Simulation {
             bounding_box_dim + floor_y,
             bounding_box_dim / 2.0
         );
-
-        for _ in 0..num_particles {
-            let x = (js_sys::Math::random() as f32 - 0.5)
-                            * bounding_box_dim;
-            let y = (js_sys::Math::random() as f32 - 0.5)
-                            * bounding_box_dim + y_offset;
-            let z = (js_sys::Math::random() as f32 - 0.5)
-                            * bounding_box_dim;
-            particles.push(Particle {
-                x,
-                y,
-                z,
-                px: x,
-                py: y,
-                pz: z,
-                vx: 0.0,
-                vy: 0.0,
-                vz: 0.0,
-            });
-        }
-
         let cell_size = 0.5;
         let grid = UniformGrid::new(cell_size, bounding_box_min,
                                                  bounding_box_max);
 
-        Simulation {
+        for _ in 0..num_particles {
+            particles.push(Particle::default())
+        }
+
+        let mut simulation = Simulation {
             particles,
+            bounding_box_dim,
             floor_y: 0.0,
             gravity: -9.81,
             last_update_time: None,
             grid,
-            rest_density: 1000.0,
-            stiffness: 1.0,
+            rest_density: 10000.0,
+            stiffness: 0.5,
             viscosity: 0.1,
-        }
+        };
+        simulation.reset_particles();
+
+        simulation
     }
 
     fn kernel_poly6(&self, r_squared: f32, d: f32) -> f32 {
@@ -219,12 +205,36 @@ impl Simulation {
         0.0
     }
 
-    fn grad_kernel_poly6(&self, r: f32, d: f32) -> f32 {
+    fn kernel_poly6_grad(&self, r: f32, d: f32) -> f32 {
         let d_squared = d * d;
         if r >= 0.0 && r <= d {
           let factor = -945.0 / (32.0 * PI * d.powi(9));
           return factor * (d_squared - r * r).powi(2) * r;
         }
+        0.0
+    }
+
+    fn kernel_spiky(&self, r: f32, d: f32) -> f32 {
+        if r >= 0.0 && r <= d {
+            let factor = 15.0 / (PI * d.powi(6));
+            return factor * (d - r).powi(3);
+        }
+        0.0
+    }
+
+    fn kernel_spiky_grad(&self, r: f32, d: f32) -> f32 {
+        if r >= 0.0 && r <= d {
+            let factor = 45.0 / (PI * d.powi(6));
+            return factor * (d - f32::abs(r)).powi(2) * (r / f32::abs(r));
+        }
+        0.0
+    }
+
+    fn kernel_viscosity(&self, r: f32, d: f32) -> f32 {
+        0.0
+    }
+
+    fn kernel_viscosity_grad(&self, r: f32, d: f32) -> f32 {
         0.0
     }
 
@@ -251,7 +261,7 @@ impl Simulation {
         let dt = match self.last_update_time {
             Some(last_time) => now.duration_since(last_time)
                                            .as_secs_f32(),
-            None => 1.0 / 60.0,
+            None => 1.0 / 30.0,
         };
         self.last_update_time = Some(now);
 
@@ -260,7 +270,9 @@ impl Simulation {
         // 1. Apply external forces and predict positions.
         for particle in &mut self.particles {
             particle.vy += self.gravity * dt;
+        }
 
+        for particle in &mut self.particles {
             particle.px = particle.x;
             particle.py = particle.y;
             particle.pz = particle.z;
@@ -277,7 +289,7 @@ impl Simulation {
         }
 
         // 3. Constraint projection
-        let num_iterations = 4;
+        let num_iterations = 3;
         for _ in 0..num_iterations {
             for i in 0..self.particles.len() {
                 let density_i = self.calculate_density(i);
@@ -307,11 +319,11 @@ impl Simulation {
                     let h = self.grid.cell_size;
 
                     if r < h && r > 1e-12 {
-                        let grad_c_i = self.grad_kernel_poly6(r, h)
+                        let grad_c_i = self.kernel_poly6_grad(r, h)
                                         * nx / r / self.rest_density;
-                        let grad_c_j = self.grad_kernel_poly6(r, h)
+                        let grad_c_j = self.kernel_poly6_grad(r, h)
                                         * ny / r / self.rest_density;
-                        let grad_c_k = self.grad_kernel_poly6(r, h)
+                        let grad_c_k = self.kernel_poly6_grad(r, h)
                                         * nz / r / self.rest_density;
 
                         let correction = pressure_i / self.rest_density;
@@ -328,16 +340,36 @@ impl Simulation {
             }
         }
 
-        // 4. Update previous position and handle collisions (floor).
+        // 4. Handle collisions and update velocities.
         for particle in &mut self.particles {
+            if particle.x < self.grid.bounding_box_min.x {
+                particle.x = self.grid.bounding_box_min.x;
+                particle.px = self.grid.bounding_box_min.x;
+            } else if particle.x > self.grid.bounding_box_max.x {
+                particle.x = self.grid.bounding_box_max.x;
+                particle.px = self.grid.bounding_box_max.x;
+            }
+
+            if particle.z < self.grid.bounding_box_min.z {
+                particle.z = self.grid.bounding_box_min.z;
+                particle.pz = self.grid.bounding_box_min.z;
+            } else if particle.z > self.grid.bounding_box_max.z {
+                particle.z = self.grid.bounding_box_max.z;
+                particle.pz = self.grid.bounding_box_max.z;
+            }
+
+            if particle.y < self.floor_y {
+                particle.y = self.floor_y;
+                particle.py = self.floor_y;
+            }
+
             particle.vx = (particle.x - particle.px) / dt;
             particle.vy = (particle.y - particle.py) / dt;
             particle.vz = (particle.z - particle.pz) / dt;
 
-            if particle.y < self.floor_y {
-                particle.y = self.floor_y;
-                particle.py = 0.0;
-            }
+            particle.x += particle.vx * dt;
+            particle.y += particle.vy * dt;
+            particle.z += particle.vz * dt;
         }
     }
 
@@ -352,16 +384,15 @@ impl Simulation {
     }
 
     pub fn reset_particles(&mut self) {
-        let bounding_box_dim = 5.0;
         let y_offset = 2.0;
 
         for particle in &mut self.particles {
             let x = (js_sys::Math::random() as f32 - 0.5)
-                            * bounding_box_dim;
+                            * self.bounding_box_dim / 2.0;
             let y = (js_sys::Math::random() as f32 - 0.5)
-                            * bounding_box_dim + y_offset;
+                            * self.bounding_box_dim / 2.0 + y_offset;
             let z = (js_sys::Math::random() as f32 - 0.5)
-                            * bounding_box_dim;
+                            * self.bounding_box_dim / 2.0;
             particle.x = x;
             particle.y = y;
             particle.z = z;
