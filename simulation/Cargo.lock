@@ -79,6 +79,7 @@ dependencies = [
  "instant",
  "js-sys",
  "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]
