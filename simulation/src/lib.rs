@@ -21,7 +21,11 @@ use std::f32::consts::PI;
 use std::ops::{Add, AddAssign, Neg, Sub};
 use wasm_bindgen::prelude::*;
 
+const CELL_SIZE: f32 = 0.25;
 const EPSILON: f32 = 1e-12;
+const NUM_ITERATIONS: usize = 3;
+const NUM_PARTICLES: usize = 1582;
+const RELAXATION: f32 = 1e-4;
 
 extern crate web_sys;
 // A macro to provide `println!(..)`-style syntax for `console.log` logging.
@@ -253,7 +257,6 @@ impl UniformGrid {
 impl Simulation {
     #[wasm_bindgen(constructor)]
     pub fn new(bounding_box_dim: f32) -> Simulation {
-        const NUM_PARTICLES: usize = 1000;
         let particles = vec![Particle::default() ; NUM_PARTICLES];
         let predictions = vec![Particle::default() ; NUM_PARTICLES];
 
@@ -267,7 +270,7 @@ impl Simulation {
             bounding_box_dim,
             bounding_box_dim / 2.0
         );
-        let cell_size = 1.0;
+        let cell_size = CELL_SIZE;
         let grid = UniformGrid::new(cell_size, bounding_box_min,
                                                  bounding_box_max);
 
@@ -279,7 +282,7 @@ impl Simulation {
             gravity: -9.81,
             last_update_time: None,
             grid,
-            rest_density: 1.0,
+            rest_density: 1e9,
             stiffness: 0.5,
             viscosity: 0.1,
         };
@@ -303,7 +306,10 @@ impl Simulation {
             let r_unit = r.scalar_mul(1.0 / r_norm);
             let factor = -45.0 / (PI * h.powi(6));
             let scalar = factor * (h - r_norm).powi(2);
-            return r_unit.scalar_mul(scalar);
+            // Flip the sign because we are actually taking the gradient with
+            // respect to the neighbor particle p_i, even though we defined the
+            // distance to be r := p_i - p_j.
+            return -r_unit.scalar_mul(scalar);
         }
         Vec3::new(0.0, 0.0, 0.0)
     }
@@ -311,7 +317,7 @@ impl Simulation {
     fn calculate_density(&self, particle: &Particle) -> f32 {
         let neighbors = self.grid.find_neighbors(particle);
         let mut density = 0.0;
-        let cutoff = self.grid.cell_size;
+        let cutoff = self.grid.cell_size * 0.1;
         let mut kernel_results: Vec<f32> = Vec::with_capacity(neighbors.len());
         let mut dists: Vec<f32> = Vec::with_capacity(neighbors.len());
 
@@ -322,13 +328,6 @@ impl Simulation {
             dists.push(dist_neighbor.norm());
             kernel_results.push(result);
             density += result;
-        }
-        if density == 0.0 {
-            let neighbor_indices = self.grid.find_neighbors(particle);
-            log!("Warning: zero density for particle with neighbors: {:?}", neighbor_indices);
-            log!("Results: {:?}", kernel_results);
-            log!("Dists: {:?}", dists);
-            log!("cell grid size and cutoff: {:?}", cutoff);
         }
         density
     }
@@ -386,12 +385,9 @@ impl Simulation {
             self.grid.insert_particle(&self.predictions[i], i);
         }
 
-        let num_iterations = 3;
-        // log!("{}", self.calculate_density(&self.predictions[0]));
-        for _ in 0..num_iterations {
+        for _ in 0..NUM_ITERATIONS {
             // 3. Solver iteration |> calculate Laplace coefficients
             let mut lambdas = vec![0.0; self.num_particles];
-            let mut sgc_debug = 0.0;
             for i in 0..self.num_particles {
                 let prediction_i = self.predictions[i];
                 let density_i = self.calculate_density(&prediction_i);
@@ -403,21 +399,8 @@ impl Simulation {
                     sum_grad_constraints += self.calculate_grad_constraint(&prediction_i, &prediction_k)
                                                 .norm_squared();
                 }
-                lambdas[i] = -constraint_i / (sum_grad_constraints + EPSILON);
-                if sum_grad_constraints + EPSILON == 0.0 {
-                    log!("Division by zero");
-                }
-                // if lambdas[i] > 5.0 {
-                //     log!("Large lambda: {}", lambdas[i]);
-                //     log!("Particle # {}", i);
-                //     log!("Neighbbors: {:?}", self.grid.find_neighbors(&prediction_i));
-                //     log!("Constraint_i: {:?}", constraint_i);
-                //     log!("Sum grad constraint: {:?}", sum_grad_constraints);
-                // }
-                sgc_debug = sum_grad_constraints;
+                lambdas[i] = -constraint_i / (sum_grad_constraints + RELAXATION);
             }
-
-            // log!("{}", sgc_debug);
 
             // 4. Solver iteration |> calculate corrections and handle collisions
             let mut delta_ps = vec![Vec3::default(); self.num_particles];
@@ -433,16 +416,13 @@ impl Simulation {
                     delta_p += self.kernel_spiky_grad(dist_ij, cutoff)
                                    .scalar_mul(scalar);
                 }
-
                 delta_ps[i] = delta_p.scalar_mul(1.0 / self.rest_density);
             }
-
-            //log!("{:?}", delta_ps[0]);
 
             for i in 0..self.num_particles {
                 let prediction_i = &mut self.predictions[i];
                 prediction_i.handle_collision(&self.grid.bounding_box_min,
-                                                &self.grid.bounding_box_max);
+                                              &self.grid.bounding_box_max);
             }
 
             // 5. Solver iteration |> update predictions
