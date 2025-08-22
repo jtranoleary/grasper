@@ -366,11 +366,12 @@ impl Simulation {
 
     pub fn update(&mut self) {
         let now = instant::Instant::now();
-        let dt = match self.last_update_time {
+        let mut dt = match self.last_update_time {
             Some(last_time) => now.duration_since(last_time)
                                            .as_secs_f32(),
-            None => 1.0 / 30.0,
+            None => 1.0 / 60.0,
         };
+        dt = dt.min(1.0 / 30.0);
         self.last_update_time = Some(now);
 
         // 1. Apply forces and populate predictions
