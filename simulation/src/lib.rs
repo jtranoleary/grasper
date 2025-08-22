@@ -16,6 +16,7 @@
 
 use instant::Instant;
 use js_sys;
+use rayon::prelude::*;
 use std::cmp;
 use std::f32::consts::PI;
 use std::ops::{Add, AddAssign, Neg, Sub};
@@ -147,6 +148,19 @@ impl Neg for Vec3 {
             y: -self.y,
             z: -self.z,
         }
+    }
+}
+
+impl std::iter::Sum for Vec3 {
+    fn sum<I>(iter: I) -> Self
+    where
+        I: Iterator<Item = Self>
+    {
+        iter.fold( Vec3::default(), |acc, item| Vec3 {
+            x: acc.x + item.x,
+            y: acc.y + item.y,
+            z: acc.z + item.z,
+        })
     }
 }
 
@@ -316,46 +330,58 @@ impl Simulation {
         Vec3::new(0.0, 0.0, 0.0)
     }
 
-    fn calculate_density(&self, particle_i_index: usize,
-                            all_neighbors: &Vec<Vec<usize>>) -> f32 {
+    fn calculate_density(
+        &self,
+        particle_i_index: usize,
+        all_neighbors: &Vec<Vec<usize>>,
+    ) -> f32 {
         let particle_i = &self.predictions[particle_i_index];
         let neighbors_i = &all_neighbors[particle_i_index];
-
-        let mut density = 0.0;
         let cutoff = self.grid.cell_size * 0.1;
 
-        for &neighbor_j_index in neighbors_i {
-            let neighbor_j = &self.predictions[neighbor_j_index];
-            let r = particle_i.position - neighbor_j.position;
-            density += self.kernel_poly6(r, cutoff);
-        }
-        density
+        neighbors_i
+            .iter()
+            .map(|&neighbor_j_index| {
+                let neighbor_j = &self.predictions[neighbor_j_index];
+                let r = particle_i.position - neighbor_j.position;
+                self.kernel_poly6(r, cutoff)
+            })
+            .sum()
     }
 
     // Computes the gradient of the constraint function for particle i, C_i,
     // with respect to particle k, i.e., \nabla_p_k C_i. Potentially accesses
     // and sums over all the neighbors of particle i.
-    fn calculate_grad_constraint(&self, particle: &Particle,
-                                    other_particle: &Particle) -> Vec3 {
+    fn calculate_grad_constraint(
+        &self,
+        particle_i_index: usize,
+        particle_k_index: usize,
+        all_neighbors: &Vec<Vec<usize>>,
+    ) -> Vec3 {
         let cutoff = self.grid.cell_size;
+        let particle_i = &self.predictions[particle_i_index];
 
         // Case 1: grad(C_i) w.r.t. itself, so a movement affects all neighbors
-        if particle == other_particle {
-            let mut sum_vec = Vec3::default();
-            let neighbor_indices_i = self.grid.find_neighbors(particle);
-            for j in neighbor_indices_i {
-                let dist_ij = particle.position - self.predictions[j].position;
-                sum_vec += self.kernel_spiky_grad(dist_ij, cutoff);
-            }
+        if particle_i_index == particle_k_index {
+            let neighbors_of_i = &all_neighbors[particle_i_index];
+            let sum_vec: Vec3 = neighbors_of_i
+                .iter()
+                .map(|&j_index| {
+                    let dist_ij = particle_i.position - self.predictions[j_index].position;
+                    self.kernel_spiky_grad(dist_ij, cutoff)
+                })
+                .sum();
             sum_vec.scalar_mul(1.0 / self.rest_density)
 
         // Case 2: grad(C_i) w.r.t. another k; if k is not a neighbor, then
         // the gradient must be 0.
         } else {
-            if particle.is_neighbor(other_particle, cutoff) {
-                let dist_ik = particle.position - other_particle.position;
-                -self.kernel_spiky_grad(dist_ik, cutoff)
-                     .scalar_mul(1.0 / self.rest_density)
+            let particle_k = &self.predictions[particle_k_index];
+            if particle_i.is_neighbor(particle_k, cutoff) {
+                let dist_ik = particle_i.position - particle_k.position;
+                -self
+                    .kernel_spiky_grad(dist_ik, cutoff)
+                    .scalar_mul(1.0 / self.rest_density)
             } else {
                 Vec3::default()
             }
@@ -396,58 +422,60 @@ impl Simulation {
             }
 
             let mut lambdas = vec![0.0; self.num_particles];
-            for i in 0..self.num_particles {
+            lambdas.par_iter_mut().enumerate().for_each(|(i, lambda)| {
                 let density_i = self.calculate_density(i, &all_neighbors);
                 let constraint_i = (density_i / self.rest_density) - 1.0;
-                let prediction_i = self.predictions[i];
+                let sum_grad_constraints: f32 = all_neighbors[i]
+                    .iter()
+                    .map(|&k| {
+                       self.calculate_grad_constraint(i, k, &all_neighbors)
+                            .norm_squared()
+                    })
+                    .sum();
+                *lambda = -constraint_i / (sum_grad_constraints + RELAXATION);
 
-                let neighbor_indices_i = &all_neighbors[i];
-                let mut sum_grad_constraints = 0.0;
-                for &k in neighbor_indices_i {
-                    let prediction_k = self.predictions[k];
-                    sum_grad_constraints += self.calculate_grad_constraint(&prediction_i, &prediction_k)
-                                                .norm_squared();
-                }
-                lambdas[i] = -constraint_i / (sum_grad_constraints + RELAXATION);
-            }
+            });
 
             // 4. Solver iteration |> calculate corrections and handle collisions
             let mut delta_ps = vec![Vec3::default(); self.num_particles];
-            for i in 0..self.num_particles {
+            delta_ps.par_iter_mut().enumerate().for_each(|(i, delta_p)| {
                 let prediction_i = self.predictions[i];
-                let mut delta_p = Vec3::default();
-                let neighbor_indices = &all_neighbors[i];
-                for &j in neighbor_indices {
-                    let prediction_j = self.predictions[j];
-                    let cutoff = self.grid.cell_size;
-                    let dist_ij = prediction_i.position - prediction_j.position;
-                    let scalar = lambdas[i] + lambdas[j];
-                    delta_p += self.kernel_spiky_grad(dist_ij, cutoff)
-                                   .scalar_mul(scalar);
-                }
-                delta_ps[i] = delta_p.scalar_mul(1.0 / self.rest_density);
-            }
+                let neighbors_i = &all_neighbors[i];
 
-            for i in 0..self.num_particles {
-                let prediction_i = &mut self.predictions[i];
+                *delta_p = neighbors_i
+                    .iter()
+                    .map(|&j| {
+                        let prediction_j = self.predictions[j];
+                        let cutoff = self.grid.cell_size;
+                        let dist_ij = prediction_i.position - prediction_j.position;
+                        let scalar = lambdas[i] + lambdas[j];
+                        self.kernel_spiky_grad(dist_ij, cutoff)
+                            .scalar_mul(scalar)
+                    })
+                    .sum::<Vec3>()
+                    .scalar_mul(1.0 / self.rest_density);
+            });
+
+            self.predictions.par_iter_mut().for_each(|prediction_i| {
                 prediction_i.handle_collision(&self.grid.bounding_box_min,
                                               &self.grid.bounding_box_max);
-            }
+            });
 
             // 5. Solver iteration |> update predictions
-            for i in 0..self.num_particles {
-                self.predictions[i].position += delta_ps[i];
-            }
+            self.predictions.iter_mut().enumerate().for_each(|(i, prediction_i)| {
+                prediction_i.position += delta_ps[i];
+            });
         }
 
         // 6. Update true velocities and positions
-        for i in 0..self.num_particles {
-            self.particles[i].velocity = (self.predictions[i].position - self.particles[i].position)
+        self.particles.iter_mut().enumerate().for_each(|(i, particle_i)| {
+            particle_i.velocity = (self.predictions[i].position - particle_i.position)
                                             .scalar_mul(1.0 / dt);
-            self.particles[i].position = self.predictions[i].position;
-        }
+            particle_i.position = self.predictions[i].position;
+        });
     }
 
+    // Used by frontend to load particle positions into the scene.
     pub fn get_particle_positions(&self) -> Vec<f32> {
         let mut positions = Vec::with_capacity(self.particles.len() * 3);
         for particle in &self.particles {
@@ -458,6 +486,7 @@ impl Simulation {
         positions
     }
 
+    // Used by frontend as a manual "reset" button.
     pub fn reset_particles(&mut self) {
         let y_offset = 2.0;
 
