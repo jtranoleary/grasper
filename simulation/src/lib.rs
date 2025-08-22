@@ -38,19 +38,38 @@ macro_rules! log {
     }
 }
 
+pub struct ParticlesData {
+    pub positions: Vec<Vec3>,
+    pub velocities: Vec<Vec3>,
+    pub predictions: Vec<Vec3>,
+    pub lambdas: Vec<f32>,
+    pub delta_ps: Vec<Vec3>,
+    count: usize,
+}
+
+impl ParticlesData {
+    pub fn new(num_particles: usize) -> Self {
+        Self {
+            positions: vec![Vec3::default(); num_particles],
+            velocities: vec![Vec3::default(); num_particles],
+            predictions: vec![Vec3::default(); num_particles],
+            lambdas: vec![0.0; num_particles],
+            delta_ps: vec![Vec3::default(); num_particles],
+            count: num_particles,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.count
+    }
+}
+
 #[wasm_bindgen]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Vec3 {
     x: f32,
     y: f32,
     z: f32,
-}
-
-#[wasm_bindgen]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Particle {
-    position: Vec3,
-    velocity: Vec3,
 }
 
 #[wasm_bindgen]
@@ -67,8 +86,7 @@ pub struct UniformGrid {
 #[wasm_bindgen]
 pub struct Simulation {
     num_particles: usize,
-    particles: Vec<Particle>,
-    predictions: Vec<Particle>,
+    particles: ParticlesData,
     bounding_box_dim: f32,
     gravity: f32,
     last_update_time: Option<Instant>,
@@ -102,6 +120,17 @@ impl Vec3 {
             y: self.y * scalar,
             z: self.z * scalar,
         }
+    }
+
+    fn is_neighbor(&self, other_particle: &Vec3, h: f32) -> bool {
+        let dist_sq = (*self - *other_particle).norm_squared();
+        dist_sq < h * h
+    }
+
+    pub fn handle_collision(&mut self, bounding_box_min: &Vec3, bounding_box_max: &Vec3) {
+        self.x = self.x.clamp(bounding_box_min.x, bounding_box_max.x);
+        self.y = self.y.clamp(bounding_box_min.y, bounding_box_max.y);
+        self.z = self.z.clamp(bounding_box_min.z, bounding_box_max.z);
     }
 }
 
@@ -164,34 +193,6 @@ impl std::iter::Sum for Vec3 {
     }
 }
 
-impl Particle {
-    fn handle_collision(&mut self, bounding_box_min: &Vec3,
-                            bounding_box_max: &Vec3) {
-        if self.position.z < bounding_box_min.z {
-            self.position.z = bounding_box_min.z;
-        } else if self.position.z > bounding_box_max.z {
-            self.position.z = bounding_box_max.z;
-        }
-
-        if self.position.x < bounding_box_min.x {
-            self.position.x = bounding_box_min.x;
-        } else if self.position.x > bounding_box_max.x {
-            self.position.x = bounding_box_max.x;
-        }
-
-        if self.position.y < bounding_box_min.y {
-            self.position.y = bounding_box_min.y;
-        } else if self.position.y > bounding_box_max.y {
-            self.position.y = bounding_box_max.y;
-        }
-    }
-
-    fn is_neighbor(&self, other_particle: &Particle, h: f32) -> bool {
-        let dist_sq = (self.position - other_particle.position).norm_squared();
-        dist_sq < h * h
-    }
-}
-
 #[wasm_bindgen]
 impl UniformGrid {
     pub fn new(cell_size: f32, bounding_box_min: Vec3,
@@ -222,12 +223,12 @@ impl UniformGrid {
         ix + iy * self.num_x + iz * self.num_x * self.num_y
     }
 
-    pub fn insert_particle(&mut self, particle: &Particle, index: usize) {
-      let ix = ((particle.position.x - self.bounding_box_min.x) / self.cell_size)
+    pub fn insert_particle(&mut self, position: &Vec3, index: usize) {
+      let ix = ((position.x - self.bounding_box_min.x) / self.cell_size)
                         .floor() as usize;
-      let iy = ((particle.position.y - self.bounding_box_min.y) / self.cell_size)
+      let iy = ((position.y - self.bounding_box_min.y) / self.cell_size)
                         .floor() as usize;
-      let iz = ((particle.position.z - self.bounding_box_min.z) / self.cell_size)
+      let iz = ((position.z - self.bounding_box_min.z) / self.cell_size)
                         .floor() as usize;
 
       let ix = cmp::min(cmp::max(ix, 0), self.num_x - 1);
@@ -244,13 +245,13 @@ impl UniformGrid {
         }
     }
 
-    pub fn find_neighbors(&self, particle: &Particle) -> Vec<usize> {
+    pub fn find_neighbors(&self, position: Vec3) -> Vec<usize> {
         let mut neighbors = Vec::new();
-        let ix = ((particle.position.x - self.bounding_box_min.x) / self.cell_size)
+        let ix = ((position.x - self.bounding_box_min.x) / self.cell_size)
                             .floor() as usize;
-        let iy = ((particle.position.y - self.bounding_box_min.y) / self.cell_size)
+        let iy = ((position.y - self.bounding_box_min.y) / self.cell_size)
                             .floor() as usize;
-        let iz = ((particle.position.z - self.bounding_box_min.z) / self.cell_size)
+        let iz = ((position.z - self.bounding_box_min.z) / self.cell_size)
                             .floor() as usize;
 
         let ix = cmp::min(cmp::max(ix, 0), self.num_x - 1);
@@ -273,9 +274,6 @@ impl UniformGrid {
 impl Simulation {
     #[wasm_bindgen(constructor)]
     pub fn new(bounding_box_dim: f32) -> Simulation {
-        let particles = vec![Particle::default() ; NUM_PARTICLES];
-        let predictions = vec![Particle::default() ; NUM_PARTICLES];
-
         let bounding_box_min = Vec3::new(
             -bounding_box_dim / 2.0,
             0.0,
@@ -292,8 +290,7 @@ impl Simulation {
 
         let mut simulation = Simulation {
             num_particles: NUM_PARTICLES,
-            particles,
-            predictions,
+            particles: ParticlesData::new(NUM_PARTICLES),
             bounding_box_dim,
             gravity: -9.81,
             last_update_time: None,
@@ -335,15 +332,15 @@ impl Simulation {
         particle_i_index: usize,
         all_neighbors: &Vec<Vec<usize>>,
     ) -> f32 {
-        let particle_i = &self.predictions[particle_i_index];
+        let particle_i = self.particles.predictions[particle_i_index];
         let neighbors_i = &all_neighbors[particle_i_index];
         let cutoff = self.grid.cell_size * 0.1;
 
         neighbors_i
             .iter()
             .map(|&neighbor_j_index| {
-                let neighbor_j = &self.predictions[neighbor_j_index];
-                let r = particle_i.position - neighbor_j.position;
+                let neighbor_j = self.particles.predictions[neighbor_j_index];
+                let r = particle_i - neighbor_j;
                 self.kernel_poly6(r, cutoff)
             })
             .sum()
@@ -359,7 +356,7 @@ impl Simulation {
         all_neighbors: &Vec<Vec<usize>>,
     ) -> Vec3 {
         let cutoff = self.grid.cell_size;
-        let particle_i = &self.predictions[particle_i_index];
+        let particle_i = self.particles.predictions[particle_i_index];
 
         // Case 1: grad(C_i) w.r.t. itself, so a movement affects all neighbors
         if particle_i_index == particle_k_index {
@@ -367,7 +364,7 @@ impl Simulation {
             let sum_vec: Vec3 = neighbors_of_i
                 .iter()
                 .map(|&j_index| {
-                    let dist_ij = particle_i.position - self.predictions[j_index].position;
+                    let dist_ij = particle_i - self.particles.predictions[j_index];
                     self.kernel_spiky_grad(dist_ij, cutoff)
                 })
                 .sum();
@@ -376,9 +373,9 @@ impl Simulation {
         // Case 2: grad(C_i) w.r.t. another k; if k is not a neighbor, then
         // the gradient must be 0.
         } else {
-            let particle_k = &self.predictions[particle_k_index];
-            if particle_i.is_neighbor(particle_k, cutoff) {
-                let dist_ik = particle_i.position - particle_k.position;
+            let particle_k = self.particles.predictions[particle_k_index];
+            if particle_i.is_neighbor(&particle_k, cutoff) {
+                let dist_ik = particle_i - particle_k;
                 -self
                     .kernel_spiky_grad(dist_ik, cutoff)
                     .scalar_mul(1.0 / self.rest_density)
@@ -400,88 +397,90 @@ impl Simulation {
 
         // 1. Apply forces and populate predictions
         for i in 0..self.num_particles {
-            self.particles[i].velocity.y += self.gravity * dt;
-            let mut prediction = self.particles[i].clone();
-            prediction.position += prediction.velocity.scalar_mul(dt);
-            self.predictions[i] = prediction;
+            self.particles.velocities[i].y += self.gravity * dt;
+            let mut prediction = self.particles.positions[i].clone();
+            prediction +=  self.particles.velocities[i].scalar_mul(dt);
+            self.particles.predictions[i] = prediction;
         }
 
         // 2. Populate grid with predictions
         self.grid.clear();
         for i in 0..self.num_particles {
-            self.grid.insert_particle(&self.predictions[i], i);
+            self.grid.insert_particle(&self.particles.predictions[i], i);
+        }
+
+        // Cache neighbors for use during the constraint iterations.
+        let mut all_neighbors: Vec<Vec<usize>> = vec![Vec::new(); self.num_particles];
+        for i in 0..self.num_particles {
+            all_neighbors[i] = self.grid.find_neighbors(self.particles.predictions[i]);
         }
 
         for _ in 0..NUM_ITERATIONS {
             // 3. Solver iteration |> calculate Laplace coefficients
+            let new_lambdas: Vec<f32> = (0..self.num_particles)
+                .into_par_iter()
+                .map(|i| {
+                    let density_i = self.calculate_density(i, &all_neighbors);
+                    let constraint_i = (density_i / self.rest_density) - 1.0;
 
-            // Cache neighbors at the beginning of the iterations loop.
-            let mut all_neighbors: Vec<Vec<usize>> = vec![Vec::new(); self.num_particles];
-            for i in 0..self.num_particles {
-                all_neighbors[i] = self.grid.find_neighbors(&self.predictions[i]);
-            }
+                    let sum_grad_constraints: f32 = all_neighbors[i]
+                        .iter()
+                        .map(|&k| {
+                            self.calculate_grad_constraint(i, k, &all_neighbors)
+                                .norm_squared()
+                        })
+                        .sum();
 
-            let mut lambdas = vec![0.0; self.num_particles];
-            lambdas.par_iter_mut().enumerate().for_each(|(i, lambda)| {
-                let density_i = self.calculate_density(i, &all_neighbors);
-                let constraint_i = (density_i / self.rest_density) - 1.0;
-                let sum_grad_constraints: f32 = all_neighbors[i]
-                    .iter()
-                    .map(|&k| {
-                       self.calculate_grad_constraint(i, k, &all_neighbors)
-                            .norm_squared()
-                    })
-                    .sum();
-                *lambda = -constraint_i / (sum_grad_constraints + RELAXATION);
-
-            });
+                    -constraint_i / (sum_grad_constraints + RELAXATION)
+                })
+                .collect();
+            self.particles.lambdas = new_lambdas;
 
             // 4. Solver iteration |> calculate corrections and handle collisions
-            let mut delta_ps = vec![Vec3::default(); self.num_particles];
-            delta_ps.par_iter_mut().enumerate().for_each(|(i, delta_p)| {
-                let prediction_i = self.predictions[i];
-                let neighbors_i = &all_neighbors[i];
+            let new_delta_ps: Vec<Vec3> = (0..self.num_particles)
+                .into_par_iter()
+                .map(|i| {
+                    all_neighbors[i]
+                        .iter()
+                        .map(|&j| {
+                            let cutoff = self.grid.cell_size;
+                            let dist_ij = self.particles.predictions[i] - self.particles.predictions[j];
+                            let scalar = self.particles.lambdas[i] + self.particles.lambdas[j];
+                            self.kernel_spiky_grad(dist_ij, cutoff)
+                                .scalar_mul(scalar)
+                        })
+                        .sum::<Vec3>()
+                        .scalar_mul(1.0 / self.rest_density)
+                })
+                .collect();
+            self.particles.delta_ps = new_delta_ps;
 
-                *delta_p = neighbors_i
-                    .iter()
-                    .map(|&j| {
-                        let prediction_j = self.predictions[j];
-                        let cutoff = self.grid.cell_size;
-                        let dist_ij = prediction_i.position - prediction_j.position;
-                        let scalar = lambdas[i] + lambdas[j];
-                        self.kernel_spiky_grad(dist_ij, cutoff)
-                            .scalar_mul(scalar)
-                    })
-                    .sum::<Vec3>()
-                    .scalar_mul(1.0 / self.rest_density);
-            });
-
-            self.predictions.par_iter_mut().for_each(|prediction_i| {
+            self.particles.predictions.iter_mut().for_each(|prediction_i| {
                 prediction_i.handle_collision(&self.grid.bounding_box_min,
                                               &self.grid.bounding_box_max);
             });
 
             // 5. Solver iteration |> update predictions
-            self.predictions.iter_mut().enumerate().for_each(|(i, prediction_i)| {
-                prediction_i.position += delta_ps[i];
+            self.particles.predictions.iter_mut().enumerate().for_each(|(i, prediction_i)| {
+                *prediction_i += self.particles.delta_ps[i];
             });
         }
 
         // 6. Update true velocities and positions
-        self.particles.iter_mut().enumerate().for_each(|(i, particle_i)| {
-            particle_i.velocity = (self.predictions[i].position - particle_i.position)
+        (0..self.particles.len()).for_each(|i| {
+            self.particles.velocities[i] = (self.particles.predictions[i] - self.particles.positions[i])
                                             .scalar_mul(1.0 / dt);
-            particle_i.position = self.predictions[i].position;
+            self.particles.positions[i] = self.particles.predictions[i];
         });
     }
 
     // Used by frontend to load particle positions into the scene.
     pub fn get_particle_positions(&self) -> Vec<f32> {
         let mut positions = Vec::with_capacity(self.particles.len() * 3);
-        for particle in &self.particles {
-            positions.push(particle.position.x);
-            positions.push(particle.position.y);
-            positions.push(particle.position.z);
+        for particle in &self.particles.positions {
+            positions.push(particle.x);
+            positions.push(particle.y);
+            positions.push(particle.z);
         }
         positions
     }
@@ -490,17 +489,18 @@ impl Simulation {
     pub fn reset_particles(&mut self) {
         let y_offset = 2.0;
 
-        for particle in &mut self.particles {
+
+        for (i, particle) in &mut self.particles.positions.iter_mut().enumerate() {
             let x = (js_sys::Math::random() as f32 - 0.5)
                             * self.bounding_box_dim / 2.0;
             let y = (js_sys::Math::random() as f32 - 0.5)
                             * self.bounding_box_dim / 2.0 + y_offset;
             let z = (js_sys::Math::random() as f32 - 0.5)
                             * self.bounding_box_dim / 2.0;
-            particle.position = Vec3::new(x, y, z);
-            particle.velocity = Vec3::default();
+            *particle = Vec3::new(x, y, z);
+            self.particles.velocities[i] = Vec3::default();
         }
 
-        self.predictions = self.particles.clone();
+        self.particles.predictions = self.particles.positions.clone();
     }
 }
