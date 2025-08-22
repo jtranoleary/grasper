@@ -23,8 +23,8 @@ use wasm_bindgen::prelude::*;
 
 const CELL_SIZE: f32 = 0.25;
 const EPSILON: f32 = 1e-12;
-const NUM_ITERATIONS: usize = 1;
-const NUM_PARTICLES: usize = 1582;
+const NUM_ITERATIONS: usize = 3;
+const NUM_PARTICLES: usize = 5000;
 const RELAXATION: f32 = 1e-4;
 
 extern crate web_sys;
@@ -173,8 +173,8 @@ impl Particle {
     }
 
     fn is_neighbor(&self, other_particle: &Particle, h: f32) -> bool {
-        let dist = self.position - other_particle.position;
-        dist.norm().powi(2) < h.powi(2)
+        let dist_sq = (self.position - other_particle.position).norm_squared();
+        dist_sq < h * h
     }
 }
 
@@ -243,9 +243,9 @@ impl UniformGrid {
         let iy = cmp::min(cmp::max(iy, 0), self.num_y - 1);
         let iz = cmp::min(cmp::max(iz, 0), self.num_z - 1);
 
-        for z in (cmp::min(iz - 1, 0))..=(cmp::min(iz + 1, self.num_z - 1)) {
-            for y in (cmp::min(iy - 1, 0))..=(cmp::min(iy + 1, self.num_y - 1)) {
-                for x in (cmp::min(ix - 1, 0))..=(cmp::min(ix + 1, self.num_x - 1)) {
+        for z in (iz.saturating_sub(1))..=(cmp::min(iz + 1, self.num_z - 1)) {
+            for y in (iy.saturating_sub(1))..=(cmp::min(iy + 1, self.num_y - 1)) {
+                for x in (ix.saturating_sub(1))..=(cmp::min(ix + 1, self.num_x - 1)) {
                     let cell_index = self.get_cell_index(x, y, z);
                     neighbors.extend(&self.cells[cell_index]);
                 }
@@ -316,20 +316,18 @@ impl Simulation {
         Vec3::new(0.0, 0.0, 0.0)
     }
 
-    fn calculate_density(&self, particle: &Particle) -> f32 {
-        let neighbors = self.grid.find_neighbors(particle);
+    fn calculate_density(&self, particle_i_index: usize,
+                            all_neighbors: &Vec<Vec<usize>>) -> f32 {
+        let particle_i = &self.predictions[particle_i_index];
+        let neighbors_i = &all_neighbors[particle_i_index];
+
         let mut density = 0.0;
         let cutoff = self.grid.cell_size * 0.1;
-        let mut kernel_results: Vec<f32> = Vec::with_capacity(neighbors.len());
-        let mut dists: Vec<f32> = Vec::with_capacity(neighbors.len());
 
-        for neighbor_index in neighbors {
-            let neighbor = &self.predictions[neighbor_index];
-            let dist_neighbor = particle.position - neighbor.position;
-            let result = self.kernel_poly6(dist_neighbor, cutoff);
-            dists.push(dist_neighbor.norm());
-            kernel_results.push(result);
-            density += result;
+        for &neighbor_j_index in neighbors_i {
+            let neighbor_j = &self.predictions[neighbor_j_index];
+            let r = particle_i.position - neighbor_j.position;
+            density += self.kernel_poly6(r, cutoff);
         }
         density
     }
@@ -390,14 +388,22 @@ impl Simulation {
 
         for _ in 0..NUM_ITERATIONS {
             // 3. Solver iteration |> calculate Laplace coefficients
+
+            // Cache neighbors at the beginning of the iterations loop.
+            let mut all_neighbors: Vec<Vec<usize>> = vec![Vec::new(); self.num_particles];
+            for i in 0..self.num_particles {
+                all_neighbors[i] = self.grid.find_neighbors(&self.predictions[i]);
+            }
+
             let mut lambdas = vec![0.0; self.num_particles];
             for i in 0..self.num_particles {
-                let prediction_i = self.predictions[i];
-                let density_i = self.calculate_density(&prediction_i);
+                let density_i = self.calculate_density(i, &all_neighbors);
                 let constraint_i = (density_i / self.rest_density) - 1.0;
-                let neighbor_indices_i = self.grid.find_neighbors(&prediction_i);
+                let prediction_i = self.predictions[i];
+
+                let neighbor_indices_i = &all_neighbors[i];
                 let mut sum_grad_constraints = 0.0;
-                for k in neighbor_indices_i {
+                for &k in neighbor_indices_i {
                     let prediction_k = self.predictions[k];
                     sum_grad_constraints += self.calculate_grad_constraint(&prediction_i, &prediction_k)
                                                 .norm_squared();
@@ -410,8 +416,8 @@ impl Simulation {
             for i in 0..self.num_particles {
                 let prediction_i = self.predictions[i];
                 let mut delta_p = Vec3::default();
-                let neighbor_indices = self.grid.find_neighbors(&prediction_i);
-                for j in neighbor_indices {
+                let neighbor_indices = &all_neighbors[i];
+                for &j in neighbor_indices {
                     let prediction_j = self.predictions[j];
                     let cutoff = self.grid.cell_size;
                     let dist_ij = prediction_i.position - prediction_j.position;
