@@ -23,12 +23,14 @@ use wasm_bindgen::prelude::*;
 
 const CELL_SIZE: f32 = 0.25;
 const EPSILON: f32 = 1e-12;
-const NUM_ITERATIONS: usize = 3;
+const NUM_ITERATIONS: usize = 1;
 const NUM_PARTICLES: usize = 1582;
 const RELAXATION: f32 = 1e-4;
 
 extern crate web_sys;
+
 // A macro to provide `println!(..)`-style syntax for `console.log` logging.
+#[allow(unused_macros)]
 macro_rules! log {
     ( $( $t:tt )* ) => {
         web_sys::console::log_1(&format!( $( $t )* ).into());
