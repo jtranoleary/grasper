@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
 import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
 import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader.js';
@@ -24,11 +25,17 @@ class GlassRendering {
     private stats!: Stats;
     private gui!: GUI;
     private composer!: EffectComposer;
-    private controls!: OrbitControls;
+    private orbitControls!: OrbitControls;
+    private transformControls!: TransformControls;
     private bloomPass!: SelectiveBloomEffect;
     private floor!: THREE.Mesh;
     private particles!: THREE.Points;
     private simulation!: Simulation;
+
+    private pipe!: THREE.Mesh;
+    private pipeHeight!: number;
+    private pipeRadius!: number;
+    private pipeRPM!: number;
 
     constructor(boundingBoxDim: number) {
         this.boundingBoxDim = boundingBoxDim;
@@ -87,6 +94,7 @@ class GlassRendering {
     private createObjects() {
         this.createParticles();
         this.createFloor();
+        this.createPipe();
     }
 
     private createParticles() {
@@ -127,6 +135,23 @@ class GlassRendering {
         floor.position.y = -0.1;
         this.floor = floor;
         this.scene.add(floor);
+    }
+
+    private createPipe() {
+        this.pipeRadius = 0.25;
+        this.pipeHeight = 4.0;
+        this.pipeRPM = 10.0;
+
+        const geometry = new THREE.CylinderGeometry(this.pipeRadius,
+            this.pipeRadius, this.pipeHeight, 32);
+        const material = new THREE.MeshStandardMaterial({
+            color: 0xcccccc,
+            metalness: 0.8,
+            roughness: 0.2,
+        });
+        this.pipe = new THREE.Mesh(geometry, material);
+        this.pipe.position.y = 4.0;
+        this.scene.add(this.pipe);
     }
 
     private setupPostProcessing() {
@@ -177,8 +202,31 @@ class GlassRendering {
     }
 
     private setupControls() {
-        this.controls = new OrbitControls(this.camera,
+        this.orbitControls = new OrbitControls(this.camera,
             this.renderer.domElement);
+
+        this.transformControls = new TransformControls(this.camera,
+            this.renderer.domElement);
+        this.transformControls.attach(this.pipe);
+        this.scene.add(this.transformControls.getHelper());
+
+        // Disable OrbitControls when using TransformControls
+        this.transformControls.addEventListener('dragging-changed', (event) => {
+            this.orbitControls.enabled = !event.value;
+        });
+        this.transformControls.addEventListener('change',
+            () => this.renderer.render(this.scene, this.camera));
+
+        window.addEventListener('keydown', (event) => {
+            switch (event.key) {
+                case 't':
+                    this.transformControls.setMode('translate');
+                    break;
+                case 'r':
+                    this.transformControls.setMode('rotate');
+                    break;
+            }
+        });
     }
 
     private setupGUI() {
@@ -205,6 +253,10 @@ class GlassRendering {
 
         fluidFolder.add(this.simulation, 'stiffness').name('Stiffness');
         fluidFolder.add(actions, 'resetParticles').name('Reset Particles');
+
+        const pipeFolder = this.gui.addFolder('Pipe Controls');
+        pipeFolder.add(this, 'pipeRPM', 0, 60, 1).name('Spin RPM');
+        pipeFolder.open();
   }
 
     private setupEventListeners() {
@@ -231,14 +283,44 @@ class GlassRendering {
         this.simulation = new Simulation(this.boundingBoxDim);
     }
 
-    private animate() {
+    private updateAndSendPipePosition(delta: number) {
+        // 1. Apply the automatic spin based on RPM
+        const rotationPerSecond = (this.pipeRPM / 60.0) * Math.PI * 2;
+        this.pipe.rotateY(rotationPerSecond * delta); // Rotate around its own Y-axis
+
+        // 2. Calculate the pipe's world transform
+        this.pipe.updateWorldMatrix(true, false);
+        const pipeHeight = this.pipeHeight;
+        const tip = new THREE.Vector3(0, -pipeHeight / 2, 0).applyMatrix4(this.pipe.matrixWorld);
+        const end = new THREE.Vector3(0, pipeHeight / 2, 0).applyMatrix4(this.pipe.matrixWorld);
+
+        // Extract the final world orientation as a quaternion
+        const orientation = new THREE.Quaternion();
+        this.pipe.getWorldQuaternion(orientation);
+
+        // 3. Send the full transform to the Rust simulation
+        this.simulation.update_pipe_transform(
+            tip.x, tip.y, tip.z,
+            end.x, end.y, end.z,
+            orientation.x, orientation.y, orientation.z, orientation.w
+        );
+    }
+
+    private animate(delta: number) {
         this.stats.update();
+        this.updateAndSendPipePosition(delta);
         this.updateParticlePositions();
         this.composer.render();
     }
 
     private startAnimationLoop() {
-        this.renderer.setAnimationLoop(this.animate.bind(this));
+        let lastTime = 0;
+        const animateLoop = (time: number) => {
+            const delta = (time - lastTime) / 1000.0;
+            lastTime = time;
+            this.animate(delta || 0);
+        };
+        this.renderer.setAnimationLoop(animateLoop);
     }
 }
 
