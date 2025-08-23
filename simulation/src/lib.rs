@@ -72,6 +72,15 @@ pub struct Vec3 {
     z: f32,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+#[wasm_bindgen]
+pub struct Quaternion {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub w: f32,
+}
+
 #[wasm_bindgen]
 pub struct UniformGrid {
     cells: Vec<Vec<usize>>,
@@ -95,6 +104,16 @@ pub struct Simulation {
     pub stiffness: f32,
     #[allow(dead_code)]
     viscosity: f32,
+    pipe: Pipe,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[wasm_bindgen]
+pub struct Pipe {
+    pub tip: Vec3,
+    pub end: Vec3,
+    pub radius: f32,
+    pub orientation: Quaternion,
 }
 
 #[wasm_bindgen]
@@ -127,10 +146,30 @@ impl Vec3 {
         dist_sq < h * h
     }
 
-    pub fn handle_collision(&mut self, bounding_box_min: &Vec3, bounding_box_max: &Vec3) {
+    pub fn handle_wall_collision(&mut self, bounding_box_min: &Vec3, bounding_box_max: &Vec3) {
         self.x = self.x.clamp(bounding_box_min.x, bounding_box_max.x);
         self.y = self.y.clamp(bounding_box_min.y, bounding_box_max.y);
         self.z = self.z.clamp(bounding_box_min.z, bounding_box_max.z);
+    }
+
+    pub fn handle_pipe_collision(&mut self, pipe: &Pipe) {
+        let line_vec = pipe.end - pipe.tip;
+        let point_vec = *self - pipe.tip;
+        let t = (line_vec.x * point_vec.x + line_vec.y * point_vec.y + line_vec.z * point_vec.z) / line_vec.norm_squared();
+        let t_clamped = t.clamp(0.0, 1.0); // Clamp to the line segment
+
+        let closest_point_on_line = pipe.tip + line_vec.scalar_mul(t_clamped);
+
+        // 2. Check for collision
+        let dist_vec = *self - closest_point_on_line;
+        let distance = dist_vec.norm();
+
+        if distance < pipe.radius {
+            // 3. Resolve collision by pushing the particle out
+            let penetration = pipe.radius - distance;
+            let correction = dist_vec.scalar_mul(penetration / distance);
+            *self += correction;
+        }
     }
 }
 
@@ -288,6 +327,15 @@ impl Simulation {
         let grid = UniformGrid::new(cell_size, bounding_box_min,
                                                  bounding_box_max);
 
+        let pipe = Pipe {
+            tip: Vec3::default(),
+            end: Vec3::default(),
+            radius: 0.5,
+            orientation: Quaternion {
+                x: 0.0, y: 0.0, z: 0.0, w: 1.0
+            }
+        };
+
         let mut simulation = Simulation {
             num_particles: NUM_PARTICLES,
             particles: ParticlesData::new(NUM_PARTICLES),
@@ -298,10 +346,22 @@ impl Simulation {
             rest_density: 1e9,
             stiffness: 0.5,
             viscosity: 0.1,
+            pipe,
         };
         simulation.reset_particles();
 
         simulation
+    }
+
+    pub fn update_pipe_transform(
+        &mut self,
+        tip_x: f32, tip_y: f32, tip_z: f32,
+        end_x: f32, end_y: f32, end_z: f32,
+        q_x: f32, q_y: f32, q_z: f32, q_w: f32,
+    ) {
+        self.pipe.tip = Vec3::new(tip_x, tip_y, tip_z);
+        self.pipe.end = Vec3::new(end_x, end_y, end_z);
+        self.pipe.orientation = Quaternion { x: q_x, y: q_y, z: q_z, w: q_w };
     }
 
     fn kernel_poly6(&self, r: Vec3, h: f32) -> f32 {
@@ -456,8 +516,9 @@ impl Simulation {
             self.particles.delta_ps = new_delta_ps;
 
             self.particles.predictions.iter_mut().for_each(|prediction_i| {
-                prediction_i.handle_collision(&self.grid.bounding_box_min,
-                                              &self.grid.bounding_box_max);
+                prediction_i.handle_pipe_collision(&self.pipe);
+                prediction_i.handle_wall_collision(&self.grid.bounding_box_min,
+                                                   &self.grid.bounding_box_max);
             });
 
             // 5. Solver iteration |> update predictions
