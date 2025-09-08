@@ -24,7 +24,7 @@ use wasm_bindgen::prelude::*;
 
 const CELL_SIZE: f32 = 0.25;
 const EPSILON: f32 = 1e-12;
-const NUM_ITERATIONS: usize = 3;
+const NUM_ITERATIONS: usize = 5;
 const NUM_PARTICLES: usize = 5000;
 const RELAXATION: f32 = 1e-4;
 
@@ -102,8 +102,7 @@ pub struct Simulation {
     grid: UniformGrid,
     rest_density: f32,
     pub stiffness: f32,
-    #[allow(dead_code)]
-    viscosity: f32,
+    pub viscosity: f32,
     pipe: Pipe,
 }
 
@@ -131,6 +130,14 @@ impl Vec3 {
 
     pub fn norm_squared(&self) -> f32 {
         self.x * self.x + self.y * self.y + self.z * self.z
+    }
+
+    pub fn cross(&self, other: Vec3) -> Vec3 {
+        Vec3 {
+            x: self.y * other.z - self.z * other.y,
+            y: self.z * other.x - self.x * other.z,
+            z: self.x * other.y - self.y * other.x
+        }
     }
 
     pub fn scalar_mul(&self, scalar: f32) -> Vec3 {
@@ -345,7 +352,7 @@ impl Simulation {
             grid,
             rest_density: 1e9,
             stiffness: 0.5,
-            viscosity: 0.1,
+            viscosity: 0.01,
             pipe,
         };
         simulation.reset_particles();
@@ -394,7 +401,7 @@ impl Simulation {
     ) -> f32 {
         let particle_i = self.particles.predictions[particle_i_index];
         let neighbors_i = &all_neighbors[particle_i_index];
-        let cutoff = self.grid.cell_size * 0.1;
+        let cutoff = self.grid.cell_size;
 
         neighbors_i
             .iter()
@@ -442,6 +449,89 @@ impl Simulation {
             } else {
                 Vec3::default()
             }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn apply_xsph_viscosity(&mut self, c: f32, all_neighbors: &Vec<Vec<usize>>) {
+        let cutoff = self.grid.cell_size;
+
+        let velocity_corrections: Vec<Vec3> = (0..self.num_particles)
+                .into_par_iter()
+                .map(|i| {
+                    all_neighbors[i]
+                        .iter()
+                        .map(|&j| {
+                            let v_ij = self.particles.velocities[j] - self.particles.velocities[i];
+                            let r_ij = self.particles.positions[i] - self.particles.positions[j];
+                            let kernel_w = self.kernel_poly6(r_ij, cutoff);
+                            v_ij.scalar_mul(kernel_w)
+                        })
+                        .sum::<Vec3>()
+                })
+                .collect();
+
+        // Apply the corrections
+        for i in 0..self.num_particles {
+            self.particles.velocities[i] += velocity_corrections[i]
+                .scalar_mul(c);
+        }
+    }
+
+    #[allow(dead_code)]
+    fn apply_vorticity_confinement(&mut self, dt: f32, epsilon: f32, all_neighbors: &Vec<Vec<usize>>) {
+        let mut vorticities = vec![Vec3::default(); self.num_particles];
+
+        // --- Step 1: Calculate the vorticity (ω = curl of velocity) for every particle ---
+        // This loop can be parallelized with Rayon.
+        for i in 0..self.num_particles {
+            let neighbors_i = &all_neighbors[i];
+            let mut sum_vec = Vec3::default();
+
+            for &j_index in neighbors_i {
+                let v_ij = self.particles.velocities[j_index] - self.particles.velocities[i];
+
+                // The gradient of the Spiky kernel is used here.
+                let r_ij = self.particles.positions[i] - self.particles.positions[j_index];
+                let grad_w = self.kernel_spiky_grad(r_ij, self.grid.cell_size);
+
+                // The cross product is the key to calculating curl.
+                sum_vec += v_ij.cross(grad_w);
+            }
+            vorticities[i] = sum_vec;
+        }
+
+        let mut confinement_forces = vec![Vec3::default(); self.num_particles];
+        // --- Step 2 & 3: Calculate the confinement force for every particle ---
+        // This loop can also be parallelized.
+        for i in 0..self.num_particles {
+            let neighbors_i = &all_neighbors[i];
+
+            // Calculate the gradient of the vorticity magnitude (η = |ω|).
+            let mut grad_vorticity_mag = Vec3::default();
+            let omega_i_mag = vorticities[i].norm();
+
+            for &j_index in neighbors_i {
+                let omega_j_mag = vorticities[j_index].norm();
+
+                let r_ij = self.particles.positions[i] - self.particles.positions[j_index];
+                let grad_w = self.kernel_spiky_grad(r_ij, self.grid.cell_size);
+
+                grad_vorticity_mag += grad_w.scalar_mul(omega_j_mag - omega_i_mag);
+            }
+
+            // Calculate the normalized location vector 'N'.
+            let norm_grad = grad_vorticity_mag.norm();
+            if norm_grad > EPSILON {
+                let n = grad_vorticity_mag.scalar_mul(1.0 / norm_grad);
+                // Calculate the final confinement force.
+                confinement_forces[i] = n.cross(vorticities[i]).scalar_mul(epsilon);
+            }
+        }
+
+        // --- Step 4: Apply the force as a velocity update ---
+        for i in 0..self.num_particles {
+            self.particles.velocities[i] += confinement_forces[i].scalar_mul(dt);
         }
     }
 
@@ -497,6 +587,11 @@ impl Simulation {
             self.particles.lambdas = new_lambdas;
 
             // 4. Solver iteration |> calculate corrections and handle collisions
+            let k = 0.1; // Tensile strength
+            let h = self.grid.cell_size;
+            let delta_q_vec = Vec3::new(0.0, 0.3 * h, 0.0); // A vector with length 0.3*h
+            let n = 4;
+
             let new_delta_ps: Vec<Vec3> = (0..self.num_particles)
                 .into_par_iter()
                 .map(|i| {
@@ -505,7 +600,10 @@ impl Simulation {
                         .map(|&j| {
                             let cutoff = self.grid.cell_size;
                             let dist_ij = self.particles.predictions[i] - self.particles.predictions[j];
-                            let scalar = self.particles.lambdas[i] + self.particles.lambdas[j];
+                            let s_corr_numer = self.kernel_poly6(dist_ij, h);
+                            let s_corr_denom = self.kernel_poly6(delta_q_vec, h);
+                            let s_corr = -k * (s_corr_numer / s_corr_denom).powi(n);
+                            let scalar = self.particles.lambdas[i] + self.particles.lambdas[j] + s_corr;
                             self.kernel_spiky_grad(dist_ij, cutoff)
                                 .scalar_mul(scalar)
                         })
@@ -527,12 +625,22 @@ impl Simulation {
             });
         }
 
-        // 6. Update true velocities and positions
-        (0..self.particles.len()).for_each(|i| {
-            self.particles.velocities[i] = (self.particles.predictions[i] - self.particles.positions[i])
-                                            .scalar_mul(1.0 / dt);
-            self.particles.positions[i] = self.particles.predictions[i];
-        });
+            // 6. Update true velocities and positions
+            for i in 0..self.num_particles {
+                if dt > EPSILON {
+                    self.particles.velocities[i] = (self.particles.predictions[i] - self.particles.positions[i])
+                                                .scalar_mul(1.0 / dt);
+                }
+            }
+
+            // 7. Apply post-processing velocity adjustments
+            self.apply_vorticity_confinement(dt, 0.001, &all_neighbors);
+            self.apply_xsph_viscosity(self.viscosity, &all_neighbors);
+
+            // 8. Final position update
+            for i in 0..self.num_particles {
+                self.particles.positions[i] = self.particles.predictions[i];
+            }
     }
 
     // Used by frontend to load particle positions into the scene.

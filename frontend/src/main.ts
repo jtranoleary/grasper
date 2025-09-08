@@ -252,6 +252,10 @@ class GlassRendering {
         };
 
         fluidFolder.add(this.simulation, 'stiffness').name('Stiffness');
+        fluidFolder.add(this.simulation, 'viscosity', 0.01, 0.05, 0.01).name('Viscosity')
+            .onChange((value: number) => {
+                    this.simulation.viscosity = value;
+                });
         fluidFolder.add(actions, 'resetParticles').name('Reset Particles');
 
         const pipeFolder = this.gui.addFolder('Pipe Controls');
