@@ -18,15 +18,19 @@ use instant::Instant;
 use js_sys;
 use rayon::prelude::*;
 use std::cmp;
+use std::collections::HashSet;
 use std::f32::consts::PI;
-use std::ops::{Add, AddAssign, Neg, Sub};
+use std::ops::{Add, AddAssign, Neg, Sub, SubAssign};
 use wasm_bindgen::prelude::*;
 
 const CELL_SIZE: f32 = 0.25;
 const EPSILON: f32 = 1e-12;
-const NUM_ITERATIONS: usize = 5;
+const NUM_ITERATIONS: usize = 3;
 const NUM_PARTICLES: usize = 5000;
 const RELAXATION: f32 = 1e-4;
+const DEFAULT_BETA: f32 = 1.005;
+const VISCOSITY_STIFFNESS_SV: f32 = 0.5;
+const REST_DENSITY: f32 = 1e9;
 
 extern crate web_sys;
 
@@ -38,12 +42,20 @@ macro_rules! log {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ViscosityConstraint {
+    p1_idx: usize,
+    p2_idx: usize,
+    d_ij: f32, // Reference distance (rest length)
+}
+
 pub struct ParticlesData {
     pub positions: Vec<Vec3>,
     pub velocities: Vec<Vec3>,
     pub predictions: Vec<Vec3>,
     pub lambdas: Vec<f32>,
     pub delta_ps: Vec<Vec3>,
+    pub betas: Vec<f32>,
     count: usize,
 }
 
@@ -55,6 +67,7 @@ impl ParticlesData {
             predictions: vec![Vec3::default(); num_particles],
             lambdas: vec![0.0; num_particles],
             delta_ps: vec![Vec3::default(); num_particles],
+            betas: vec![DEFAULT_BETA; num_particles],
             count: num_particles,
         }
     }
@@ -96,14 +109,16 @@ pub struct UniformGrid {
 pub struct Simulation {
     num_particles: usize,
     particles: ParticlesData,
-    bounding_box_dim: f32,
     gravity: f32,
     last_update_time: Option<Instant>,
     grid: UniformGrid,
     rest_density: f32,
-    pub stiffness: f32,
-    pub viscosity: f32,
+    pub xsph_viscosity: f32,
     pipe: Pipe,
+
+    viscosity_constraints: Vec<ViscosityConstraint>,
+    viscosity_stiffness_sv: f32,
+    max_constraint_distance_h: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -163,16 +178,14 @@ impl Vec3 {
         let line_vec = pipe.end - pipe.tip;
         let point_vec = *self - pipe.tip;
         let t = (line_vec.x * point_vec.x + line_vec.y * point_vec.y + line_vec.z * point_vec.z) / line_vec.norm_squared();
-        let t_clamped = t.clamp(0.0, 1.0); // Clamp to the line segment
+        let t_clamped = t.clamp(0.0, 1.0);
 
         let closest_point_on_line = pipe.tip + line_vec.scalar_mul(t_clamped);
 
-        // 2. Check for collision
         let dist_vec = *self - closest_point_on_line;
         let distance = dist_vec.norm();
 
-        if distance < pipe.radius {
-            // 3. Resolve collision by pushing the particle out
+        if distance < pipe.radius && distance > EPSILON {
             let penetration = pipe.radius - distance;
             let correction = dist_vec.scalar_mul(penetration / distance);
             *self += correction;
@@ -211,6 +224,16 @@ impl Sub for Vec3 {
             y: self.y - other.y,
             z: self.z - other.z,
         }
+    }
+}
+
+impl SubAssign for Vec3 {
+    fn sub_assign(&mut self, other: Self) {
+        *self = Self {
+            x: self.x - other.x,
+            y: self.y - other.y,
+            z: self.z - other.z,
+        };
     }
 }
 
@@ -318,6 +341,12 @@ impl UniformGrid {
 
 #[wasm_bindgen]
 impl Simulation {
+    // Helper function to calculate the Poly6 kernel value at r=0 (self-contribution)
+    // W(0, h) = 315.0 / (64.0 * PI * h^3)
+    fn kernel_poly6_zero(h: f32) -> f32 {
+        315.0 / (64.0 * PI * h.powi(3))
+    }
+
     #[wasm_bindgen(constructor)]
     pub fn new(bounding_box_dim: f32) -> Simulation {
         let bounding_box_min = Vec3::new(
@@ -343,17 +372,20 @@ impl Simulation {
             }
         };
 
+        let calculated_rest_density = Simulation::kernel_poly6_zero(cell_size) * 1.2;
+
         let mut simulation = Simulation {
             num_particles: NUM_PARTICLES,
             particles: ParticlesData::new(NUM_PARTICLES),
-            bounding_box_dim,
             gravity: -9.81,
             last_update_time: None,
             grid,
-            rest_density: 1e9,
-            stiffness: 0.5,
-            viscosity: 0.01,
+            rest_density: REST_DENSITY,
+            xsph_viscosity: 0.01,
             pipe,
+            viscosity_constraints: Vec::new(),
+            viscosity_stiffness_sv: VISCOSITY_STIFFNESS_SV,
+            max_constraint_distance_h: 2.0 * cell_size, // H = 2h
         };
         simulation.reset_particles();
 
@@ -452,7 +484,6 @@ impl Simulation {
         }
     }
 
-    #[allow(dead_code)]
     fn apply_xsph_viscosity(&mut self, c: f32, all_neighbors: &Vec<Vec<usize>>) {
         let cutoff = self.grid.cell_size;
 
@@ -478,74 +509,130 @@ impl Simulation {
         }
     }
 
-    #[allow(dead_code)]
-    fn apply_vorticity_confinement(&mut self, dt: f32, epsilon: f32, all_neighbors: &Vec<Vec<usize>>) {
-        let mut vorticities = vec![Vec3::default(); self.num_particles];
+    fn manage_viscosity_constraints(&mut self, all_neighbors: &Vec<Vec<usize>>) {
+        let h = self.grid.cell_size;
+        let h_delete = self.max_constraint_distance_h;
 
-        // --- Step 1: Calculate the vorticity (ω = curl of velocity) for every particle ---
-        // This loop can be parallelized with Rayon.
-        for i in 0..self.num_particles {
-            let neighbors_i = &all_neighbors[i];
-            let mut sum_vec = Vec3::default();
+        let predictions = &self.particles.predictions;
+        let betas = &self.particles.betas;
 
-            for &j_index in neighbors_i {
-                let v_ij = self.particles.velocities[j_index] - self.particles.velocities[i];
+        // 1. Delete and Modify existing constraints (Alg 1, lines 1-7)
+        // Use retain_mut for efficient in-place modification and removal.
+        self.viscosity_constraints.retain_mut(|constraint| {
+            let p1 = predictions[constraint.p1_idx];
+            let p2 = predictions[constraint.p2_idx];
+            let current_dist = (p1 - p2).norm();
 
-                // The gradient of the Spiky kernel is used here.
-                let r_ij = self.particles.positions[i] - self.particles.positions[j_index];
-                let grad_w = self.kernel_spiky_grad(r_ij, self.grid.cell_size);
-
-                // The cross product is the key to calculating curl.
-                sum_vec += v_ij.cross(grad_w);
-            }
-            vorticities[i] = sum_vec;
-        }
-
-        let mut confinement_forces = vec![Vec3::default(); self.num_particles];
-        // --- Step 2 & 3: Calculate the confinement force for every particle ---
-        // This loop can also be parallelized.
-        for i in 0..self.num_particles {
-            let neighbors_i = &all_neighbors[i];
-
-            // Calculate the gradient of the vorticity magnitude (η = |ω|).
-            let mut grad_vorticity_mag = Vec3::default();
-            let omega_i_mag = vorticities[i].norm();
-
-            for &j_index in neighbors_i {
-                let omega_j_mag = vorticities[j_index].norm();
-
-                let r_ij = self.particles.positions[i] - self.particles.positions[j_index];
-                let grad_w = self.kernel_spiky_grad(r_ij, self.grid.cell_size);
-
-                grad_vorticity_mag += grad_w.scalar_mul(omega_j_mag - omega_i_mag);
+            if current_dist > h_delete {
+                return false;
             }
 
-            // Calculate the normalized location vector 'N'.
-            let norm_grad = grad_vorticity_mag.norm();
-            if norm_grad > EPSILON {
-                let n = grad_vorticity_mag.scalar_mul(1.0 / norm_grad);
-                // Calculate the final confinement force.
-                confinement_forces[i] = n.cross(vorticities[i]).scalar_mul(epsilon);
-            }
-        }
+            let alpha = 0.01;
+            if constraint.d_ij - current_dist < alpha * constraint.d_ij {
+                let beta_i = betas[constraint.p1_idx];
+                let beta_j = betas[constraint.p2_idx];
 
-        // --- Step 4: Apply the force as a velocity update ---
+                let avg_beta_increment = (beta_i + beta_j) * 0.5;
+                constraint.d_ij *= 1.0 + avg_beta_increment;
+
+                if constraint.d_ij > h_delete {
+                    constraint.d_ij = h_delete;
+                }
+            }
+            true
+        });
+
+        // 2. Generate new constraints (Alg 1, lines 8-11)
+        // Track existing pairs to avoid duplication.
+        let mut existing_pairs: HashSet<(usize, usize)> = self.viscosity_constraints
+            .iter()
+            .map(|c| {
+                if c.p1_idx < c.p2_idx { (c.p1_idx, c.p2_idx) } else { (c.p2_idx, c.p1_idx) }
+            })
+            .collect();
+
         for i in 0..self.num_particles {
-            self.particles.velocities[i] += confinement_forces[i].scalar_mul(dt);
+            for &j in &all_neighbors[i] {
+                if i < j {
+                    let pair = (i, j);
+                    if !existing_pairs.contains(&pair) {
+                        let dist = (predictions[i] - predictions[j]).norm();
+
+                        if dist < h && dist > EPSILON {
+                            self.viscosity_constraints.push(ViscosityConstraint {
+                                p1_idx: i,
+                                p2_idx: j,
+                                d_ij: dist,
+                            });
+                            existing_pairs.insert(pair);
+                        }
+                    }
+                }
+            }
         }
     }
 
+    fn calculate_viscosity_corrections(&self) -> Vec<Vec3> {
+        let s_v = self.viscosity_stiffness_sv;
+        let mass_ratio = 0.5;
+        let predictions = &self.particles.predictions;
+
+        self.viscosity_constraints
+            .par_iter()
+            .fold(
+                || vec![Vec3::default(); self.num_particles],
+                |mut acc, constraint| {
+                    let i = constraint.p1_idx;
+                    let j = constraint.p2_idx;
+                    let d_ij = constraint.d_ij;
+
+                    let p_ij = predictions[i] - predictions[j];
+                    let current_dist = p_ij.norm();
+
+                    if current_dist > d_ij && current_dist > EPSILON {
+                        let violation = current_dist - d_ij;
+                        let direction = p_ij.scalar_mul(1.0 / current_dist);
+
+                        let correction_magnitude = s_v * mass_ratio * violation;
+                        let correction = direction.scalar_mul(correction_magnitude);
+
+                        acc[i] -= correction;
+                        acc[j] += correction;
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || vec![Vec3::default(); self.num_particles],
+                |mut acc1, acc2| {
+                    for k in 0..self.num_particles {
+                        acc1[k] += acc2[k];
+                    }
+                    acc1
+                },
+            )
+    }
+
     pub fn update(&mut self) {
+        let dt = 1.0 / 60.0;
+
         let now = instant::Instant::now();
-        let mut dt = match self.last_update_time {
-            Some(last_time) => now.duration_since(last_time)
-                                           .as_secs_f32(),
-            None => 1.0 / 60.0,
-        };
-        dt = dt.min(1.0 / 30.0);
         self.last_update_time = Some(now);
 
-        // 1. Apply forces and populate predictions
+        self.grid.clear();
+        for i in 0..self.num_particles {
+            self.grid.insert_particle(&self.particles.positions[i], i);
+        }
+        let initial_neighbors: Vec<Vec<usize>> = (0..self.num_particles)
+            .into_par_iter()
+            .map(|i| self.grid.find_neighbors(self.particles.positions[i]))
+            .collect();
+
+        // 1. Apply XSPH viscosity (Alg 2, line 5)
+        self.apply_xsph_viscosity(self.xsph_viscosity, &initial_neighbors);
+
+
+        // 2. Apply forces and predict positions (Alg 2, lines 6-7)
         for i in 0..self.num_particles {
             self.particles.velocities[i].y += self.gravity * dt;
             let mut prediction = self.particles.positions[i].clone();
@@ -553,20 +640,23 @@ impl Simulation {
             self.particles.predictions[i] = prediction;
         }
 
-        // 2. Populate grid with predictions
+        // 3. Find neighbors based on predictions (p_i) (Alg 2, line 10)
         self.grid.clear();
         for i in 0..self.num_particles {
             self.grid.insert_particle(&self.particles.predictions[i], i);
         }
 
-        // Cache neighbors for use during the constraint iterations.
-        let mut all_neighbors: Vec<Vec<usize>> = vec![Vec::new(); self.num_particles];
-        for i in 0..self.num_particles {
-            all_neighbors[i] = self.grid.find_neighbors(self.particles.predictions[i]);
-        }
+        // Cache neighbors for the solver loop.
+        let all_neighbors: Vec<Vec<usize>> = (0..self.num_particles)
+            .into_par_iter()
+            .map(|i| self.grid.find_neighbors(self.particles.predictions[i]))
+            .collect();
+
+        // 4. Control constraints (Alg 2, line 11)
+        self.manage_viscosity_constraints(&all_neighbors);
 
         for _ in 0..NUM_ITERATIONS {
-            // 3. Solver iteration |> calculate Laplace coefficients
+            // 5a. Calculate Lambdas (Density Constraint)
             let new_lambdas: Vec<f32> = (0..self.num_particles)
                 .into_par_iter()
                 .map(|i| {
@@ -581,28 +671,41 @@ impl Simulation {
                         })
                         .sum();
 
-                    -constraint_i / (sum_grad_constraints + RELAXATION)
+                    if sum_grad_constraints < EPSILON && constraint_i.abs() < EPSILON {
+                        0.0
+                    } else {
+                        -constraint_i / (sum_grad_constraints + RELAXATION)
+                    }
                 })
                 .collect();
             self.particles.lambdas = new_lambdas;
 
-            // 4. Solver iteration |> calculate corrections and handle collisions
-            let k = 0.1; // Tensile strength
-            let h = self.grid.cell_size;
-            let delta_q_vec = Vec3::new(0.0, 0.3 * h, 0.0); // A vector with length 0.3*h
-            let n = 4;
+            // 5b. Calculate Corrections (Δp_dens and Δp_visc) (Alg 2, line 18)
 
-            let new_delta_ps: Vec<Vec3> = (0..self.num_particles)
+            // i. Calculate Density Corrections (Δp_dens)
+            let k = 0.1;
+            let h = self.grid.cell_size;
+            let delta_q_mag = 0.2 * h;
+            let delta_q_vec = Vec3::new(delta_q_mag, 0.0, 0.0);
+            let n = 4;
+            let s_corr_denom = self.kernel_poly6(delta_q_vec, h);
+
+            let density_delta_ps: Vec<Vec3> = (0..self.num_particles)
                 .into_par_iter()
                 .map(|i| {
-                    all_neighbors[i]
+                     all_neighbors[i]
                         .iter()
                         .map(|&j| {
                             let cutoff = self.grid.cell_size;
                             let dist_ij = self.particles.predictions[i] - self.particles.predictions[j];
                             let s_corr_numer = self.kernel_poly6(dist_ij, h);
-                            let s_corr_denom = self.kernel_poly6(delta_q_vec, h);
-                            let s_corr = -k * (s_corr_numer / s_corr_denom).powi(n);
+
+                            let s_corr = if s_corr_denom > EPSILON {
+                                -k * (s_corr_numer / s_corr_denom).powi(n)
+                            } else {
+                                0.0
+                            };
+
                             let scalar = self.particles.lambdas[i] + self.particles.lambdas[j] + s_corr;
                             self.kernel_spiky_grad(dist_ij, cutoff)
                                 .scalar_mul(scalar)
@@ -611,36 +714,38 @@ impl Simulation {
                         .scalar_mul(1.0 / self.rest_density)
                 })
                 .collect();
-            self.particles.delta_ps = new_delta_ps;
 
-            self.particles.predictions.iter_mut().for_each(|prediction_i| {
+            // ii. Calculate Viscosity Corrections (Δp_visc)
+            let viscosity_delta_ps = self.calculate_viscosity_corrections();
+
+            // 5c. Update predictions and handle collisions (Alg 2, line 20)
+            // p_i <- p_i + Δp_dens + Δp_visc
+            self.particles.predictions.iter_mut().enumerate().for_each(|(i, prediction_i)| {
+                let total_delta_p = density_delta_ps[i] + viscosity_delta_ps[i];
+
+                // Store total delta_p (optional, useful for debugging)
+                self.particles.delta_ps[i] = total_delta_p;
+                *prediction_i += total_delta_p;
+
+                // Handle collisions after combining all corrections
                 prediction_i.handle_pipe_collision(&self.pipe);
                 prediction_i.handle_wall_collision(&self.grid.bounding_box_min,
                                                    &self.grid.bounding_box_max);
             });
-
-            // 5. Solver iteration |> update predictions
-            self.particles.predictions.iter_mut().enumerate().for_each(|(i, prediction_i)| {
-                *prediction_i += self.particles.delta_ps[i];
-            });
         }
 
-            // 6. Update true velocities and positions
-            for i in 0..self.num_particles {
-                if dt > EPSILON {
-                    self.particles.velocities[i] = (self.particles.predictions[i] - self.particles.positions[i])
-                                                .scalar_mul(1.0 / dt);
-                }
+        // 6. Update velocities (Alg 2, line 22)
+        for i in 0..self.num_particles {
+            if dt > EPSILON {
+                self.particles.velocities[i] = (self.particles.predictions[i] - self.particles.positions[i])
+                                            .scalar_mul(1.0 / dt);
             }
+        }
 
-            // 7. Apply post-processing velocity adjustments
-            self.apply_vorticity_confinement(dt, 0.001, &all_neighbors);
-            self.apply_xsph_viscosity(self.viscosity, &all_neighbors);
-
-            // 8. Final position update
-            for i in 0..self.num_particles {
-                self.particles.positions[i] = self.particles.predictions[i];
-            }
+        // 7. Final position update (Alg 2, line 23)
+        for i in 0..self.num_particles {
+            self.particles.positions[i] = self.particles.predictions[i];
+        }
     }
 
     // Used by frontend to load particle positions into the scene.
@@ -656,18 +761,41 @@ impl Simulation {
 
     // Used by frontend as a manual "reset" button.
     pub fn reset_particles(&mut self) {
-        let y_offset = 2.0;
-
-
-        for (i, particle) in &mut self.particles.positions.iter_mut().enumerate() {
-            let x = (js_sys::Math::random() as f32 - 0.5)
-                            * self.bounding_box_dim / 2.0;
-            let y = (js_sys::Math::random() as f32 - 0.5)
-                            * self.bounding_box_dim / 2.0 + y_offset;
-            let z = (js_sys::Math::random() as f32 - 0.5)
-                            * self.bounding_box_dim / 2.0;
-            *particle = Vec3::new(x, y, z);
+        // Clear constraints and reset particle data
+        self.viscosity_constraints.clear();
+        for i in 0..self.num_particles {
+            self.particles.betas[i] = DEFAULT_BETA;
             self.particles.velocities[i] = Vec3::default();
+        }
+
+        // Initialize in a structured grid.
+        // Spacing should be related to the kernel radius for stable packing.
+        let spacing = self.grid.cell_size * 1.0;
+        let particles_per_dim = (self.num_particles as f32).cbrt().ceil() as usize;
+        let y_offset = 5.0; // Start higher up
+
+        // Calculate offsets to center the block horizontally
+        let block_width = particles_per_dim as f32 * spacing;
+        let center_offset = -block_width / 2.0;
+
+        for i in 0..self.num_particles {
+            let ix = i % particles_per_dim;
+            let iy = (i / particles_per_dim) % particles_per_dim;
+            let iz = i / (particles_per_dim * particles_per_dim);
+
+            let x = (ix as f32 * spacing) + center_offset;
+            let y = (iy as f32 * spacing) + y_offset;
+            let z = (iz as f32 * spacing) + center_offset;
+
+            // Add a tiny jitter to prevent perfect alignment artifacts
+            let jitter_scale = spacing * 0.05;
+            let jitter = Vec3::new(
+                (js_sys::Math::random() as f32 - 0.5) * jitter_scale,
+                (js_sys::Math::random() as f32 - 0.5) * jitter_scale,
+                (js_sys::Math::random() as f32 - 0.5) * jitter_scale,
+            );
+
+            self.particles.positions[i] = Vec3::new(x, y, z) + jitter;
         }
 
         self.particles.predictions = self.particles.positions.clone();
