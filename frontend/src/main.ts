@@ -251,10 +251,9 @@ class GlassRendering {
             resetParticles: () => this.simulation.reset_particles()
         };
 
-        fluidFolder.add(this.simulation, 'stiffness').name('Stiffness');
-        fluidFolder.add(this.simulation, 'viscosity', 0.01, 0.05, 0.01).name('Viscosity')
+        fluidFolder.add(this.simulation, 'xsph_viscosity', 0.01, 0.05, 0.01).name('Viscosity')
             .onChange((value: number) => {
-                    this.simulation.viscosity = value;
+                    this.simulation.xsph_viscosity = value;
                 });
         fluidFolder.add(actions, 'resetParticles').name('Reset Particles');
 
@@ -330,7 +329,7 @@ class GlassRendering {
 
 async function main() {
     await init();
-    new GlassRendering(5.0);
+    new GlassRendering(10.0);
 }
 
 main();
