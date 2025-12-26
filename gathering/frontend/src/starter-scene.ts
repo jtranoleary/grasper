@@ -14,7 +14,7 @@
 
 // This file is the simulation's main entry point.
 
-import * as THREE from 'three';
+import * as THREE from '../node_modules/@types/three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
 import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
