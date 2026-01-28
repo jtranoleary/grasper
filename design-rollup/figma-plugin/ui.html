@@ -1,0 +1,47 @@
+<div id="status" style="font-family: sans-serif; font-size: 12px; padding: 10px;">
+  Waiting for selection...
+</div>
+
+<button id="sync-button" style="font-family: sans-serif; font-size: 12px; margin-left: 10px;">Sync!</button>
+
+<script>
+  const syncButton = document.getElementById('sync-button');
+  const statusDiv = document.getElementById('status');
+
+  syncButton.onclick = function () {
+    parent.postMessage({ pluginMessage: { type: 'sync-drawing' } }, '*');
+  };
+
+  window.onmessage = async (event) => {
+    const msg = event.data.pluginMessage;
+
+    if (msg.type === 'status') {
+      statusDiv.innerText = msg.msg;
+      syncButton.disabled = msg.syncButtonDisabled;
+    }
+
+    if (msg.type === 'image-data') {
+      const bytes = msg.bytes;
+
+      statusDiv.innerText = `Uploading ${bytes.length} bytes...`;
+
+      // Upload to your Node.js Bridge
+      try {
+        await fetch('http://localhost:3001/upload', {
+          method: 'POST',
+          headers: { 'Content-Type': 'image/png' },
+          body: new Uint8Array(bytes)
+        });
+        statusDiv.innerText = 'Synced!';
+      } catch (e) {
+        statusDiv.innerText = 'Error: Is npm run dev:bridge running?';
+      }
+    }
+  };
+
+  function areEqual(a, b) {
+    if (a.length !== b.length) return false;
+    // Check a few samples to save CPU
+    return a[0] === b[0] && a[a.length - 1] === b[b.length - 1];
+  }
+</script>
