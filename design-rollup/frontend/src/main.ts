@@ -108,18 +108,15 @@ async function init() {
         switch (e.key.toLowerCase()) {
             case 'j': // Jack
                 if (selectedY !== null) {
-                    console.log(`Applying Jack at Y=${selectedY.toFixed(2)}`);
                     glassSim.apply_jack(selectedY, 0.1, 10.0); // Reduced sigma for sharper cut
                     updateGeometryFromSimulation();
                 } else {
                     console.log("No height selected for Jack. Click on the glass first.");
                 }
                 break;
-                break;
             case 'arrowup':
                 if (selectedY !== null) {
                     const offset = 5.0;
-                    console.log(`Stretching Up at Y=${selectedY.toFixed(2)}`);
                     glassSim.apply_boundary_stretch(selectedY, offset); // Up
 
                     // Update selection to follow the moving part
@@ -134,7 +131,6 @@ async function init() {
             case 'arrowdown':
                 if (selectedY !== null) {
                     const offset = -5.0;
-                    console.log(`Stretching Down at Y=${selectedY.toFixed(2)}`);
                     glassSim.apply_boundary_stretch(selectedY, offset); // Down
 
                     // Update selection to follow the moving part
