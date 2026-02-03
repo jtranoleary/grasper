@@ -267,6 +267,27 @@ function updateGeometryFromSimulation() {
     }
 }
 
+function resetSimulation(width: number, height: number) {
+    if (glassSim) {
+        glassSim.free();
+    }
+
+    // Calculate new radius based on circumference (width)
+    // Circumference = 2 * PI * r  =>  r = Width / (2 * PI)
+    const newRadius = width / (2 * Math.PI);
+    const newHeight = height;
+
+    glassSim = new GlassSimulation(newRadius, newHeight, 64);
+    console.log(`Simulation reset: Width=${width} (R=${newRadius.toFixed(2)}), Height=${newHeight}`);
+
+    // Reset selection state
+    selectedY = null;
+    selectionRing.visible = false;
+    previewRing.visible = false;
+
+    updateGeometryFromSimulation();
+}
+
 function connectToFigmaBridge(targetMaterial: THREE.MeshStandardMaterial) {
     const ws = new WebSocket('ws://localhost:3002');
 
@@ -283,6 +304,13 @@ function connectToFigmaBridge(targetMaterial: THREE.MeshStandardMaterial) {
 
             texture.colorSpace = THREE.SRGBColorSpace;
             texture.flipY = true;
+
+            // Reset simulation to match new image dimensions
+            // We assume pixel 1:1 mapping for this simulation context
+            const img = texture.image;
+            if (img.width && img.height) {
+                resetSimulation(img.width, img.height);
+            }
 
             targetMaterial.map = texture;
             targetMaterial.needsUpdate = true;
