@@ -53,6 +53,8 @@ impl GlassSimulation {
             
             self.points[r_idx] = r_new;
         }
+
+        self.resample(5.0);
     }
 
     pub fn apply_stretch(&mut self, factor: f32) {
@@ -71,6 +73,8 @@ impl GlassSimulation {
             self.points[r_idx] *= r_scale;
             self.points[y_idx] *= factor;
         }
+
+        self.resample(5.0);
     }
 
     pub fn apply_boundary_stretch(&mut self, y_origin: f32, offset: f32) {
@@ -107,6 +111,45 @@ impl GlassSimulation {
                 }
             }
         }
+
+        self.resample(5.0);
+    }
+
+    fn resample(&mut self, threshold: f32) {
+        if self.points.len() < 4 { return; }
+
+        let mut new_points = Vec::with_capacity(self.points.len());
+
+        // Start with the first point
+        new_points.push(self.points[0]);
+        new_points.push(self.points[1]);
+
+        for i in (0..self.points.len() - 2).step_by(2) {
+            let r_curr = self.points[i];
+            let y_curr = self.points[i + 1];
+            let r_next = self.points[i + 2];
+            let y_next = self.points[i + 3];
+
+            let dy = (y_next - y_curr).abs();
+
+            if dy > threshold {
+                let segments = (dy / threshold).ceil() as usize;
+                // Add intermediate points
+                for j in 1..segments {
+                    let t = j as f32 / segments as f32;
+                    let r_interp = r_curr + (r_next - r_curr) * t;
+                    let y_interp = y_curr + (y_next - y_curr) * t;
+                    new_points.push(r_interp);
+                    new_points.push(y_interp);
+                }
+            }
+
+            // Add the next point
+            new_points.push(r_next);
+            new_points.push(y_next);
+        }
+
+        self.points = new_points;
     }
 
     pub fn get_points(&self) -> Vec<f32> {
