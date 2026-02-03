@@ -4,6 +4,8 @@ use wasm_bindgen::prelude::*;
 pub struct GlassSimulation {
     // Stored as flattened [x0, y0, x1, y1, ...]
     points: Vec<f32>,
+    // Stored as [v0, v1, ...] matching points pairs
+    vs: Vec<f32>,
 }
 
 #[wasm_bindgen]
@@ -20,14 +22,21 @@ impl GlassSimulation {
         // though LatheGeometry usually takes points. The order matters for the face culling.
         // Three.js Lathe usually expects points with increasing Y if you want simple mapping, 
         // but we can just be consistent.
-        
+
+        let mut vs = Vec::with_capacity(segments);
+
         for i in 0..segments {
             let y = half_height - (i as f32 * segment_height);
             points.push(radius); // x (radius)
             points.push(y);      // y
+
+            // V goes from 1.0 (top) to 0.0 (bottom) so that V=0 aligns with the bottom of the mesh.
+            // i=0 is Top (+y).
+            let v = 1.0 - (i as f32 / (segments as f32 - 1.0));
+            vs.push(v);
         }
 
-        GlassSimulation { points }
+        GlassSimulation { points, vs }
     }
 
     pub fn apply_jack(&mut self, y_center: f32, amplitude: f32, sigma: f32) {
@@ -112,23 +121,53 @@ impl GlassSimulation {
             }
         }
 
+        self.ensure_monotonicity();
         self.resample(5.0);
+    }
+
+    fn ensure_monotonicity(&mut self) {
+        let count = self.vs.len();
+        if count == 0 { return; }
+
+        // Zip (r, y, v)
+        let mut triplets: Vec<(f32, f32, f32)> = Vec::with_capacity(count);
+        for i in 0..count {
+            triplets.push((self.points[i*2], self.points[i*2+1], self.vs[i]));
+        }
+
+        // Sort by Y descending (Top to Bottom)
+        // Since we want to match the original High -> Low order.
+        triplets.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Validate strictly descending to avoid duplicates?
+        // Resample handles duplicates gracefully usually (dy=0), but let's just unzip.
+        
+        for i in 0..count {
+            self.points[i*2] = triplets[i].0;
+            self.points[i*2+1] = triplets[i].1;
+            self.vs[i] = triplets[i].2;
+        }
     }
 
     fn resample(&mut self, threshold: f32) {
         if self.points.len() < 4 { return; }
 
         let mut new_points = Vec::with_capacity(self.points.len());
-
+        let mut new_vs = Vec::with_capacity(self.vs.len());
+        
         // Start with the first point
         new_points.push(self.points[0]);
         new_points.push(self.points[1]);
+        new_vs.push(self.vs[0]);
 
         for i in (0..self.points.len() - 2).step_by(2) {
             let r_curr = self.points[i];
             let y_curr = self.points[i + 1];
+            let v_curr = self.vs[i / 2];
+
             let r_next = self.points[i + 2];
             let y_next = self.points[i + 3];
+            let v_next = self.vs[i / 2 + 1];
 
             let dy = (y_next - y_curr).abs();
 
@@ -139,20 +178,30 @@ impl GlassSimulation {
                     let t = j as f32 / segments as f32;
                     let r_interp = r_curr + (r_next - r_curr) * t;
                     let y_interp = y_curr + (y_next - y_curr) * t;
+                    let v_interp = v_curr + (v_next - v_curr) * t;
+
                     new_points.push(r_interp);
                     new_points.push(y_interp);
+                    new_vs.push(v_interp);
                 }
             }
 
             // Add the next point
             new_points.push(r_next);
             new_points.push(y_next);
+            new_vs.push(v_next);
         }
 
         self.points = new_points;
+        self.vs = new_vs;
     }
 
     pub fn get_points(&self) -> Vec<f32> {
         self.points.clone()
     }
+
+    pub fn get_vs(&self) -> Vec<f32> {
+        self.vs.clone()
+    }
 }
+mod tests;
