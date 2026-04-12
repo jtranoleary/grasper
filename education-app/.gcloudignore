@@ -1,0 +1,16 @@
+# ignore standard compiled files and dependencies
+node_modules/
+dist/
+
+# ignore git directories
+.git/
+.gitignore
+
+# ignore system files
+.DS_Store
+
+# ignore environment files
+.env
+
+# ignore lockfile containing internal Artifact Registry endpoints
+package-lock.json
