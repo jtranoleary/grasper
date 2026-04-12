@@ -40,3 +40,7 @@
 *.swo
 
 simulation/target/
+.idea/
+node_modules/
+dist/
+.vite/
